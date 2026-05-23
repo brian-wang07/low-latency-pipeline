@@ -5,69 +5,63 @@
 
 namespace common {
 
-template <typename T, uint32_t capacity>
-struct alignas(64) SpscRing {
-    // capacity must be power of 2
-    static_assert((capacity & (capacity-1)) == 0);
+template <typename T, uint32_t capacity> struct alignas(64) SpscRing {
+  // capacity must be power of 2
+  static_assert((capacity & (capacity - 1)) == 0);
 
+  static constexpr uint32_t MASK = capacity - 1;
 
-    static constexpr uint32_t MASK = capacity - 1;
+  alignas(64) std::atomic<uint32_t> head{0};
+  alignas(64) std::atomic<uint32_t> tail{0};
 
+  alignas(64) T slots[capacity];
 
-    alignas(64) std::atomic<uint32_t> head{0};
-    alignas(64) std::atomic<uint32_t> tail{0};
+  bool try_push(const T &item) noexcept {
 
+    uint32_t write_idx = tail.load(std::memory_order_relaxed);
+    uint32_t read_idx = head.load(std::memory_order_acquire);
 
-    alignas(64) T slots[capacity];
+    if (write_idx - read_idx == capacity)
+      return false;
 
+    slots[write_idx & MASK] = item;
+    tail.store(write_idx + 1, std::memory_order_release);
 
-    bool try_push(const T& item) noexcept {
+    return true;
+  };
 
-        uint32_t write_idx = tail.load(std::memory_order_relaxed);
-        uint32_t read_idx  = head.load(std::memory_order_acquire);
+  template <typename... Args> bool try_emplace(Args &&...args) noexcept {
+    // basically always prefer this, Event type has no heap allocated fields
 
-        if (write_idx - read_idx == capacity) return false;
+    uint32_t write_idx = tail.load(std::memory_order_relaxed);
+    uint32_t read_idx = head.load(std::memory_order_acquire);
 
-        slots[write_idx & MASK] = item;
-        tail.store(write_idx + 1, std::memory_order_release);
+    if (write_idx - read_idx == capacity)
+      return false;
 
-        return true;
-    };
+    new (&slots[write_idx & MASK]) T(std::forward<Args>(args)...);
+    tail.store(write_idx + 1, std::memory_order_release);
 
+    return true;
+  }
 
-    template <typename... Args>
-    bool try_emplace(Args&&... args) noexcept {
-        // basically always prefer this, Event type has no heap allocated fields
+  bool try_pop(T &out) noexcept {
 
-        uint32_t write_idx = tail.load(std::memory_order_relaxed);
-        uint32_t read_idx  = head.load(std::memory_order_acquire);
+    uint32_t read_idx = head.load(std::memory_order_relaxed);
+    uint32_t write_idx = tail.load(std::memory_order_acquire);
 
-        if (write_idx - read_idx == capacity) return false;
-    
-        new (&slots[write_idx & MASK]) T(std::forward<Args>(args)...);
-        tail.store(write_idx + 1, std::memory_order_release);
+    if (write_idx == read_idx)
+      return false;
 
-        return true;
-    }
+    out = slots[read_idx & MASK];
+    head.store(read_idx + 1, std::memory_order_release);
 
+    return true;
+  }
 
-    bool try_pop(T& out) noexcept {
+  uint32_t size() const noexcept {
 
-        uint32_t read_idx  = head.load(std::memory_order_relaxed);
-        uint32_t write_idx = tail.load(std::memory_order_acquire);
-
-        if (write_idx == read_idx) return false;
-
-        out = slots[read_idx & MASK];
-        head.store(read_idx + 1, std::memory_order_release);
-        
-        return true;
-    }
-
-    
-    uint32_t size() const noexcept {
-
-    };
+  };
 };
 
-} // common
+} // namespace common
