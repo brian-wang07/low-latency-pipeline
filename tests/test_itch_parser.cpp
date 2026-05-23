@@ -4,9 +4,9 @@
 #include <iostream>
 #include <thread>
 
-#include "../src/common/event.hpp"
-#include "../src/exchange/exchange.hpp"
-#include "../src/exchange/itch/itch_parser.hpp"
+#include "common/event.hpp"
+#include "common/ipc/exchange_shm.hpp"
+#include "exchange/itch/itch_parser.hpp"
 
 int main(int argc, char* argv[]) {
     const char* path = (argc > 1) ? argv[1] : "../itch_feed/S071321-v50.txt";

@@ -7,11 +7,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#include "../../common/event.hpp"
-#include "../../common/platform/spin_pause.hpp"
-#include "../../common/spsc_ring.hpp"
-#include "itch_event_types.hpp"
-#include "itch_parser.hpp"
+#include "common/event.hpp"
+#include "common/platform/spin_pause.hpp"
+#include "common/spsc_ring.hpp"
+#include "exchange/itch/itch_event_types.hpp"
+#include "exchange/itch/itch_parser.hpp"
 
 ItchParser::ItchParser(int fd, exchange::ExchangeRing *ring) noexcept
     : fd_(fd), ring_(ring) {
