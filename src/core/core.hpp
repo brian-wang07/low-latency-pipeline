@@ -1,38 +1,35 @@
 #pragma once
 
 #include "common/event.hpp"
+#include <climits>
 #include <cstdint>
+#include <memory>
 
-namespace core {
-
-// stock locate hashmap, orderbook impl
+namespace core::equity {
 
 using Price = uint32_t; // 4 decimal fixed point
 using Qty = uint32_t;
-using OrderRef = uint64_t; // order_ref_number
+using OrderRef = uint64_t;
 
-// Passive orderbook reconstruction. As data is pre-matched by the exchange, we
-// only need to reconstruct the state.
-struct alignas(32) OrderEntry {
+struct OrderEntry {
   Price price;
   Qty shares;
   common::Side side;
-  char _pad[3];
 };
 
-// flat hash map: by storing keys and values in a contiguous array, we can
-// maximize cache locality.
-struct OrderMap {
+// Flat open-addressed hash, robin-hood eviction. Single-writer; no alignment
+// padding because there are no concurrent readers to false-share with.
+template <uint32_t Capacity> class OrderMap {
+  static_assert((Capacity & (Capacity - 1)) == 0,
+                "Capacity must be power of 2");
+
 public:
-  static constexpr uint32_t CAPACITY = 1 << 20;
-  static constexpr uint32_t MASK = CAPACITY - 1;
+  static constexpr uint32_t CAPACITY = Capacity;
+  static constexpr uint32_t MASK = Capacity - 1;
 
-  // pointer to order reference number, nullptr if dne
   OrderEntry *find(OrderRef ref) noexcept;
-
   void insert(OrderRef ref, Price price, Qty shares,
               common::Side side) noexcept;
-
   void erase(OrderRef ref) noexcept;
 
 private:
@@ -45,44 +42,56 @@ private:
     OrderEntry entry;
     bool occupied;
   };
-  alignas(64) Slot slots_[CAPACITY];
+  Slot slots_[Capacity]{};
 };
 
-struct alignas(64) PriceLevel {
+struct PriceLevel {
   Qty total_shares;
   uint32_t order_count;
-  char _pad[56];
 };
 
-class PriceLevelArray {
+template <uint32_t MaxLevels> class PriceLevelArray {
+  static_assert((MaxLevels & (MaxLevels - 1)) == 0,
+                "MaxLevels must be power of 2");
+
 public:
-  static constexpr uint32_t MAX_LEVELS =
-      1 << 16; // 665536 levels @ $0.0001/tick -> $6.55 range; maybe widen?
+  static constexpr uint32_t MAX_LEVELS = MaxLevels;
 
-  // on first order seen; set base price, zero array
   void init(Price base_price) noexcept;
-
   PriceLevel &at(Price price) noexcept;
   const PriceLevel &at(Price price) const noexcept;
-
   uint32_t index_of(Price price) const noexcept;
-
+  bool in_range(Price price) const noexcept;
   Price base_price() const noexcept;
 
-  bool in_range(Price price) const noexcept;
-
 private:
-  Price base_price_;
-  alignas(64) PriceLevel levels_[MAX_LEVELS];
+  Price base_price_{0};
+  PriceLevel levels_[MaxLevels]{};
 };
 
-struct alignas(64) TopOfBook {
+struct TopOfBook {
   Price best_bid{0};
   Price best_ask{UINT32_MAX};
 };
 
+// Sizing for one liquid US equity. ~10 MB per book:
+//   orders_ : 262144 * 24 B  = 6 MB
+//   bids_   : 262144 *  8 B  = 2 MB
+//   asks_   : 262144 *  8 B  = 2 MB
+// Level range = 262144 ticks = $26.2144 around base_price.
+inline constexpr uint32_t DEFAULT_ORDER_CAPACITY = 262144;
+inline constexpr uint32_t DEFAULT_LEVEL_COUNT = 262144;
+
 class OrderBook {
 public:
+  using LevelArr = PriceLevelArray<DEFAULT_LEVEL_COUNT>;
+  using Orders = OrderMap<DEFAULT_ORDER_CAPACITY>;
+
+  struct Level {
+    Price price;
+    Qty shares;
+  };
+
   OrderBook() = default;
   OrderBook(const OrderBook &) = delete;
   OrderBook &operator=(const OrderBook &) = delete;
@@ -107,24 +116,34 @@ public:
 
   Price best_bid() const noexcept;
   Price best_ask() const noexcept;
-  Qty qty_at_bid(const Price p) const noexcept;
-  Qty qty_at_ask(const Price p) const noexcept;
+  Qty qty_at_bid(Price p) const noexcept;
+  Qty qty_at_ask(Price p) const noexcept;
+
+  // Walk top non-empty levels from TOB into out[]. Returns number written.
+  int top_bids(Level *out, int max_out) const noexcept;
+  int top_asks(Level *out, int max_out) const noexcept;
 
   uint64_t stock_id() const noexcept;
   bool initialized() const noexcept;
 
 private:
   void rescan(common::Side side, Price price) noexcept;
+
   bool initialized_{false};
   TopOfBook tob_;
-  uint64_t stock_id_;
-  PriceLevelArray bids_;
-  PriceLevelArray asks_;
-  OrderMap orders_;
+  uint64_t stock_id_{0};
+  LevelArr bids_;
+  LevelArr asks_;
+  Orders orders_;
 };
 
 struct BookArray {
-  OrderBook books_[65536];
+  std::unique_ptr<OrderBook> books_[65536];
+
+  OrderBook &ensure(uint16_t locate, uint64_t stock_id,
+                    Price base_price) noexcept;
+  OrderBook *get(uint16_t locate) noexcept;
+  const OrderBook *get(uint16_t locate) const noexcept;
 };
 
-} // namespace core
+} // namespace core::equity

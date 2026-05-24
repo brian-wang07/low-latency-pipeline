@@ -5,7 +5,7 @@
 #include "common/event.hpp"
 #include "core/core.hpp"
 
-using namespace core;
+using namespace core::equity;
 using common::Side;
 
 static int passed = 0;

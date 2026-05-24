@@ -21,3 +21,12 @@ add_executable(test_orderbook
 )
 target_include_directories(test_orderbook PRIVATE src)
 target_compile_options(test_orderbook PRIVATE -O2)
+
+add_executable(parse_to_orderbook
+    tests/parse_to_orderbook.cpp
+    src/exchange/itch/itch_parser.cpp
+    src/core/core.cpp
+)
+target_include_directories(parse_to_orderbook PRIVATE src)
+target_compile_options(parse_to_orderbook PRIVATE -O2)
+target_link_libraries(parse_to_orderbook PRIVATE Threads::Threads)
