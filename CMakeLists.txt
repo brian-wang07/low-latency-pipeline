@@ -14,3 +14,10 @@ add_executable(test_itch_parser
 target_include_directories(test_itch_parser PRIVATE src)
 target_compile_options(test_itch_parser PRIVATE -O2)
 target_link_libraries(test_itch_parser PRIVATE Threads::Threads)
+
+add_executable(test_orderbook
+    tests/test_orderbook.cpp
+    src/core/core.cpp
+)
+target_include_directories(test_orderbook PRIVATE src)
+target_compile_options(test_orderbook PRIVATE -O2)

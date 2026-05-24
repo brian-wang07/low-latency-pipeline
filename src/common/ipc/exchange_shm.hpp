@@ -2,7 +2,6 @@
 
 #include "common/event.hpp"
 #include "common/spsc_ring.hpp"
-#include <atomic>
 #include <cstdint>
 
 namespace exchange {
