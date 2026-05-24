@@ -13,7 +13,7 @@
 #include "exchange/itch/itch_event_types.hpp"
 #include "exchange/itch/itch_parser.hpp"
 
-ItchParser::ItchParser(int fd, exchange::ExchangeRing *ring) noexcept
+ItchParser::ItchParser(int fd, core::CoreRing *ring) noexcept
     : fd_(fd), ring_(ring) {
 
   fstat(fd_, &fs_);

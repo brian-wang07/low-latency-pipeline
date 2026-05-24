@@ -8,11 +8,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#include "common/ipc/exchange_shm.hpp"
+#include "common/ipc/shm.hpp"
 
 class ItchParser {
 public:
-  ItchParser(int fd, exchange::ExchangeRing *ring) noexcept;
+  ItchParser(int fd, core::CoreRing *ring) noexcept;
   void next();
   bool done() const noexcept { return cursor_ >= end_; }
 
@@ -40,7 +40,7 @@ private:
   }
 
   int fd_;
-  exchange::ExchangeRing *ring_;
+  core::CoreRing *ring_;
   struct stat fs_;
   const uint8_t *data_;
   const uint8_t *cursor_;

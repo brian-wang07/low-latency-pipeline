@@ -30,3 +30,29 @@ add_executable(parse_to_orderbook
 target_include_directories(parse_to_orderbook PRIVATE src)
 target_compile_options(parse_to_orderbook PRIVATE -O2)
 target_link_libraries(parse_to_orderbook PRIVATE Threads::Threads)
+
+add_executable(manager
+    src/manager/manager.cpp
+    src/common/ipc/shm_segment.cpp
+)
+target_include_directories(manager PRIVATE src)
+target_compile_options(manager PRIVATE -O2)
+target_link_libraries(manager PRIVATE Threads::Threads)
+
+add_executable(exchange_main
+    src/exchange/exchange_main.cpp
+    src/exchange/itch/itch_parser.cpp
+    src/common/ipc/shm_segment.cpp
+)
+target_include_directories(exchange_main PRIVATE src)
+target_compile_options(exchange_main PRIVATE -O2)
+target_link_libraries(exchange_main PRIVATE Threads::Threads)
+
+add_executable(core_main
+    src/core/core_main.cpp
+    src/core/core.cpp
+    src/common/ipc/shm_segment.cpp
+)
+target_include_directories(core_main PRIVATE src)
+target_compile_options(core_main PRIVATE -O2)
+target_link_libraries(core_main PRIVATE Threads::Threads)

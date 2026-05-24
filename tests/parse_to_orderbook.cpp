@@ -8,7 +8,7 @@
 #include <thread>
 
 #include "common/event.hpp"
-#include "common/ipc/exchange_shm.hpp"
+#include "common/ipc/shm.hpp"
 #include "core/core.hpp"
 #include "exchange/itch/itch_parser.hpp"
 
@@ -52,7 +52,7 @@ int main() {
     return 1;
   }
 
-  auto ring = std::make_unique<exchange::ExchangeRing>();
+  auto ring = std::make_unique<core::CoreRing>();
   std::atomic<bool> done{false};
 
   std::thread producer([&] {
