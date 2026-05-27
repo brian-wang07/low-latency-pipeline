@@ -38,6 +38,42 @@
 └────────────────────────────────────────────────┘                                                                   
 ```
 
+## orderbook
+
+The engine in `src/core/` reconstructs a per-symbol limit order book from the ITCH stream. Going from leaves to root:
+
+**`OrderEntry`** — `{price, shares, side}` per live order. ITCH's cancel/execute/delete reference an order by `OrderRef` and do *not* repeat side or price, so we have to remember them ourselves.
+
+**`OrderMap<Capacity>`** (`OrderRef → OrderEntry`) — flat, open-addressed hash with robin-hood eviction. Chosen because:
+- Flat slot array: zero heap allocs on insert, no pointer chasing on lookup.
+- Linear probing: probes walk consecutive slots → cache-friendly.
+- Robin-hood + shift-back erase: bounds worst-case probe length under load and avoids the tombstone tax of lazy deletion.
+- Power-of-two capacity (`262144`): mask replaces modulo.
+- Golden-ratio multiplicative hash: ITCH refs are near-sequential and would collide badly with identity hashing.
+- No alignment padding: single-writer, no concurrent readers on this structure (readers go through the snapshot).
+
+**`PriceLevel`** — `{total_shares, order_count}` aggregate per price. Pre-aggregated so reads never traverse a per-price order list. `order_count` is kept separately because we need to detect the moment a level drains to trigger rescan.
+
+**`PriceLevelArray<MaxLevels>`** — flat array of `PriceLevel`, indexed by `(price - base_price) / PRICE_TICK`. One per side. Chosen because:
+- O(1) random-access by price: one subtract-divide-load, vs O(log n) and pointer-chasing for `std::map`.
+- Zero allocation, no rebalancing.
+- Sequential memory layout makes `top_bids` / `top_asks` walks prefetcher-friendly.
+- Bucketed by cent (`PRICE_TICK = 100`) since Reg NMS forbids sub-penny pricing for stocks ≥ $1 — costs nothing for normal equities and gives 100× more level range for the same memory. Window is $2621.44 wide.
+
+The trade-off is the fixed window. `base_price` is seeded from the first add for a symbol minus a small offset; out-of-range adds are silently dropped (and currently logged to stdout while we tune).
+
+**`TopOfBook`** — `{best_bid, best_ask}` cache. Without it, every TOB query would scan the level array. Maintained incrementally: `on_add` updates with a single compare-store, `rescan` only runs when a level drains. Sentinel values (`0` and `UINT32_MAX`) naturally lose the first comparison so the first real order always wins.
+
+**`OrderBook`** — composes `TopOfBook` + two `PriceLevelArray`s + one `OrderMap` for a single symbol. ~10 MB. Non-copyable.
+
+**`BookArray`** — `unique_ptr<OrderBook>[65536]` indexed by ITCH `stock_locate` (the 16-bit per-symbol id assigned at SoD). Direct array index = O(1) symbol lookup at the very top of the hot path, no hashing or string compare. `unique_ptr` so the 10 MB per book only allocates for symbols actually seen.
+
+**`BookSnapshot<depth>` + `BookSeqlock<depth>`** — the publish boundary. Snapshot is a POD frame (TOB + top N levels per side). The seqlock ships it lock-free from the writer thread to the snapshotter; readers retry on torn reads. This decouples the single-writer hot path from any reader's pace.
+
+Overall shape: **hash for "find this order"**, **two arrays for "find this price level"**, **cached pair for "find best price"**, **outer array for "find this symbol"**, **seqlock + POD frame for "ship state out"**. Direct indexing where the key space is small and dense, hashing where it's large and sparse.
+
+## hugepages
+
 Explicit Hugepages setup:
 Manager is responsible for raii of page, thuis we use memfd_create. 
 1. Allocate hugepages

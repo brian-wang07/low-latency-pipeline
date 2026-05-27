@@ -1,9 +1,11 @@
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
 #include <string>
+#include <thread>
 
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
@@ -46,8 +48,9 @@ int main(int argc, char **argv) {
     std::perror("pin_to_core exchange");
 
   ItchParser parser{data_fd, &p->exchange_to_core};
-  while (!parser.done() && !shutdown_flag)
+  while (!parser.done() && !shutdown_flag) {
     parser.next();
-
+    std::this_thread::sleep_for(std::chrono::nanoseconds(1));
+  }
   return 0;
 }

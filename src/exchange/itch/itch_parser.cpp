@@ -9,7 +9,7 @@
 
 #include "common/event.hpp"
 #include "common/platform/spin_pause.hpp"
-#include "common/spsc_ring.hpp"
+#include "common/platform/tsc.hpp"
 #include "exchange/itch/itch_event_types.hpp"
 #include "exchange/itch/itch_parser.hpp"
 
@@ -180,5 +180,6 @@ void ItchParser::next() {
   }
 
   cursor_ += frame_length - 1;
+  slot->tsc_in = read_tsc();
   ring_->tail.store(tail + 1, std::memory_order_release);
 }

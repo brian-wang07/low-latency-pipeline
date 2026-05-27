@@ -19,7 +19,8 @@ struct alignas(64) Event {
   uint32_t price;
   uint64_t match_number{0};         // for execute, trade, broken trade
   uint64_t new_order_ref_number{0}; // for replace
-  char _pad[10];
+  uint64_t tsc_in;
+  char _pad[2];
 };
 
 } // namespace common

@@ -1,4 +1,6 @@
-// for now, we just print everything
+// Hot thread: drives the orderbook off the exchange ring and publishes a
+// fixed-size frame to the seqlock after each event. All rendering /
+// downstream work happens on the snapshotter thread, never here.
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -6,40 +8,46 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
+#include "common/histogram.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
 #include "common/platform/cpu_pin.hpp"
 #include "common/platform/spin_pause.hpp"
+#include "common/platform/tsc.hpp"
 #include "core/core.hpp"
+#include "core/snapshot/book_snapshot.hpp"
+#include "core/snapshot/book_snapshotter.hpp"
 
 static volatile std::sig_atomic_t shutdown_flag{0};
 static void on_signal(int) { shutdown_flag = 1; }
 
-static constexpr char PRIMARY[8] = {'T', 'Q', 'Q', 'Q', ' ', ' ', ' ', ' '};
-static constexpr int DEPTH = 15;
+static constexpr char PRIMARY[8] = {'N', 'V', 'D', 'A', ' ', ' ', ' ', ' '};
+static constexpr std::size_t DEPTH = 15;
+static constexpr int HOT_CORE = 4;
+static constexpr int SNAPSHOT_CORE = 5;
 
-static void render(const core::equity::OrderBook &book, uint64_t event_count) {
-  core::equity::OrderBook::Level bids[DEPTH];
-  core::equity::OrderBook::Level asks[DEPTH];
-  int nb = book.top_bids(bids, DEPTH);
-  int na = book.top_asks(asks, DEPTH);
-
+// Snapshotter callback. Runs on the snapshotter thread only. Temporary
+// stand-in until the dashboard process consumes from an SPSC ring.
+static void render(const core::BookSnapshot<DEPTH> &snap) {
   std::fputs("\033[H\033[2J", stdout);
-  std::printf("%.8s  events=%lu\n\n", PRIMARY,
-              static_cast<unsigned long>(event_count));
+  std::printf("%.8s  events=%lu\n\n", snap.stock_id,
+              static_cast<unsigned long>(snap.event_seq));
   std::printf("%12s %12s   ||   %-12s %-12s\n", "Bid Qty", "Bid Price",
               "Ask Price", "Ask Qty");
   std::printf("%12s %12s   ||   %-12s %-12s\n", "------------", "------------",
               "------------", "------------");
-  for (int i = 0; i < DEPTH; ++i) {
-    if (i < nb)
-      std::printf("%12u %12.4f", bids[i].shares, bids[i].price / 10000.0);
+  for (std::size_t i = 0; i < DEPTH; ++i) {
+    if (static_cast<int>(i) < snap.nb)
+      std::printf("%12u %12.4f", snap.bids[i].shares,
+                  snap.bids[i].price / 10000.0);
     else
       std::printf("%12s %12s", "", "");
     std::fputs("   ||   ", stdout);
-    if (i < na)
-      std::printf("%-12.4f %-12u\n", asks[i].price / 10000.0, asks[i].shares);
+    if (static_cast<int>(i) < snap.na)
+      std::printf("%-12.4f %-12u\n", snap.asks[i].price / 10000.0,
+                  snap.asks[i].shares);
     else
       std::printf("%-12s %-12s\n", "", "");
   }
@@ -71,31 +79,35 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 
-  if (!pin_to_core(4))
-    std::perror("pin_to_core core");
+  if (!pin_to_core(HOT_CORE))
+    std::perror("pin_to_core hot");
+
+  // calibrate
+  double tsc_per_ns;
+  calibrate_tsc(tsc_per_ns);
+
+  // Latency log. Path overridable per-run via LAT_LOG=foo.log ./core ...
+  // Line-buffered so `tail -f` shows new dumps live.
+  const char *lat_log_path = std::getenv("LAT_LOG");
+  if (!lat_log_path)
+    lat_log_path = "latency.log";
+  std::FILE *lat_log = std::fopen(lat_log_path, "w");
+  if (!lat_log) {
+    std::perror("fopen latency log");
+    return 1;
+  }
+  std::setvbuf(lat_log, nullptr, _IOLBF, 0);
 
   static core::equity::BookArray engine;
 
-  // Captured from the first A/F we see for PRIMARY. Locate is the only
-  // identifier present on E/C/X/D/U messages.
+  // In-process bridge between hot thread (writer) and snapshotter thread
+  // (reader). Not in shm — both threads live in this process.
+  static core::BookSeqlock<DEPTH> book_seq;
+  core::BookSnapshot<DEPTH> scratch{};
+
   uint16_t primary_locate = 0;
   bool primary_locked = false;
   uint64_t primary_count = 0;
-
-  // Redraws can't keep up with raw event rate; cap at ~30 fps.
-  auto last_draw = std::chrono::steady_clock::now();
-  const auto frame = std::chrono::milliseconds(33);
-  auto maybe_draw = [&] {
-    if (!primary_locked)
-      return;
-    auto now = std::chrono::steady_clock::now();
-    if (now - last_draw < frame)
-      return;
-    const core::equity::OrderBook *book = engine.get(primary_locate);
-    if (book && book->initialized())
-      render(*book, primary_count);
-    last_draw = now;
-  };
 
   auto process = [&](const common::Event &ev) {
     core::equity::OrderBook *book = nullptr;
@@ -103,18 +115,17 @@ int main(int argc, char **argv) {
 
     if (is_add) {
       // Subscription gate: only A/F carries the stock symbol on the wire.
-      // (Extend here to subscribe more tickers.)
       if (std::memcmp(ev.stock, PRIMARY, 8) != 0)
         return;
-      // Anchor base 32 768 ticks (~$3.28) below first seen price.
-      core::equity::Price base = ev.price > 32768u ? ev.price - 32768u : 0u;
+      constexpr uint32_t HALF =
+          core::equity::DEFAULT_LEVEL_COUNT / 2 * core::equity::PRICE_TICK;
+      core::equity::Price base = ev.price > HALF ? ev.price - HALF : 0u;
       book = &engine.ensure(ev.stock_locate, ev.stock_locate, base);
       if (!primary_locked) {
         primary_locate = ev.stock_locate;
         primary_locked = true;
       }
     } else {
-      // E/C/X/D/U: locate is the only stock identifier on the wire.
       book = engine.get(ev.stock_locate);
       if (!book)
         return;
@@ -145,23 +156,59 @@ int main(int argc, char **argv) {
       break;
     }
 
-    maybe_draw();
+    // attempt to publish frame
+    core::capture(scratch, *book, PRIMARY, primary_count);
+    book_seq.store(scratch);
   };
 
+  // snapshot thread
+  std::atomic<bool> snap_shutdown{false};
+  std::thread snap_thread([&] {
+    core::run_snapshotter<DEPTH>(book_seq, SNAPSHOT_CORE,
+                                 std::chrono::milliseconds(33), snap_shutdown,
+                                 render);
+  });
+
   common::Event ev;
-  while (!shutdown_flag) {
-    if (ring->try_pop(ev))
+  common::Histogram hist_ipc;
+  common::Histogram hist_core;
+  common::Histogram hist_e2e;
+  constexpr uint64_t HIST_MASK = (1ull << 16) - 1; // 65k events
+  constexpr uint64_t MAX_EVENTS = 20'000'000;
+  uint64_t n{0};
+  while (!shutdown_flag && n < MAX_EVENTS) {
+    if (ring->try_pop(ev)) {
+      uint64_t t1 = read_tsc();
       process(ev);
+      uint64_t t3 = read_tsc();
+      hist_ipc.record(t1 - ev.tsc_in);
+      hist_core.record(t3 - t1);
+      hist_e2e.record(t3 - ev.tsc_in);
+      if ((++n & HIST_MASK) == 0) {
+        hist_ipc.dump(lat_log, "transit", tsc_per_ns);
+        hist_core.dump(lat_log, "process", tsc_per_ns);
+        hist_e2e.dump(lat_log, "e2e", tsc_per_ns);
+      }
+    }
   }
   while (ring->try_pop(ev))
     process(ev);
 
-  if (!primary_locked) {
+  snap_shutdown.store(true, std::memory_order_release);
+  snap_thread.join();
+
+  std::fprintf(lat_log, "\n=== aggregated (n=%llu) ===\n",
+               static_cast<unsigned long long>(n));
+  hist_ipc.dump(lat_log, "transit", tsc_per_ns);
+  hist_core.dump(lat_log, "process", tsc_per_ns);
+  hist_e2e.dump(lat_log, "e2e", tsc_per_ns);
+  std::fprintf(lat_log, "\n=== full distribution ===\n");
+  hist_ipc.dump_full(lat_log, "transit", tsc_per_ns);
+  hist_core.dump_full(lat_log, "process", tsc_per_ns);
+  hist_e2e.dump_full(lat_log, "e2e", tsc_per_ns);
+  std::fclose(lat_log);
+
+  if (!primary_locked)
     std::printf("No %.8s events seen\n", PRIMARY);
-    return 0;
-  }
-  const core::equity::OrderBook *book = engine.get(primary_locate);
-  if (book)
-    render(*book, primary_count);
   return 0;
 }

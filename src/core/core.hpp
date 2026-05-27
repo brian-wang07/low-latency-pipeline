@@ -11,6 +11,9 @@ using Price = uint32_t; // 4 decimal fixed point
 using Qty = uint32_t;
 using OrderRef = uint64_t;
 
+// min tick size is $0.01; prices come in at 4 decimal point accuracy, so scale by this much 
+inline constexpr Price PRICE_TICK = 100;
+
 struct OrderEntry {
   Price price;
   Qty shares;
@@ -74,13 +77,9 @@ struct TopOfBook {
   Price best_ask{UINT32_MAX};
 };
 
-// Sizing for one liquid US equity. ~10 MB per book:
-//   orders_ : 262144 * 24 B  = 6 MB
-//   bids_   : 262144 *  8 B  = 2 MB
-//   asks_   : 262144 *  8 B  = 2 MB
-// Level range = 262144 ticks = $26.2144 around base_price.
-inline constexpr uint32_t DEFAULT_ORDER_CAPACITY = 262144;
-inline constexpr uint32_t DEFAULT_LEVEL_COUNT = 262144;
+// is this overkill?
+inline constexpr uint32_t DEFAULT_ORDER_CAPACITY = 1048576;
+inline constexpr uint32_t DEFAULT_LEVEL_COUNT = 1048576;
 
 class OrderBook {
 public:

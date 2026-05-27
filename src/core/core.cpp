@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 
 #include "common/event.hpp"
 #include "core.hpp"
@@ -57,7 +58,7 @@ void OrderMap<Capacity>::erase(OrderRef ref) noexcept {
 // PriceLevelArray
 template <uint32_t MaxLevels>
 uint32_t PriceLevelArray<MaxLevels>::index_of(Price price) const noexcept {
-  return price - base_price_;
+  return (price - base_price_) / PRICE_TICK;
 }
 
 template <uint32_t MaxLevels>
@@ -77,7 +78,7 @@ const PriceLevel &PriceLevelArray<MaxLevels>::at(Price price) const noexcept {
 
 template <uint32_t MaxLevels>
 void PriceLevelArray<MaxLevels>::init(Price base_price) noexcept {
-  base_price_ = base_price;
+  base_price_ = (base_price / PRICE_TICK) * PRICE_TICK;
   std::memset(levels_, 0, MAX_LEVELS * sizeof(PriceLevel));
 }
 
@@ -94,12 +95,17 @@ template class core::equity::PriceLevelArray<DEFAULT_LEVEL_COUNT>;
 void OrderBook::rescan(common::Side side, Price price) noexcept {
   if (side == common::Side::Buy && price == tob_.best_bid) {
     while (bids_.in_range(tob_.best_bid) &&
-           bids_.at(tob_.best_bid).order_count == 0)
-      --tob_.best_bid;
+           bids_.at(tob_.best_bid).order_count == 0) {
+      if (tob_.best_bid < PRICE_TICK) {
+        tob_.best_bid = 0;
+        return;
+      }
+      tob_.best_bid -= PRICE_TICK;
+    }
   } else if (side == common::Side::Sell && price == tob_.best_ask) {
     while (asks_.in_range(tob_.best_ask) &&
            asks_.at(tob_.best_ask).order_count == 0)
-      ++tob_.best_ask;
+      tob_.best_ask += PRICE_TICK;
   }
 }
 
@@ -114,8 +120,14 @@ void OrderBook::init(uint64_t stock_id, Price base_price) noexcept {
 void OrderBook::on_add(OrderRef ref, common::Side side, Price price,
                        Qty shares) noexcept {
   if (side == common::Side::Buy) {
-    if (!bids_.in_range(price))
+    if (!bids_.in_range(price)) {
+      std::cout << "DROP add stock=" << stock_id_ << " side=B"
+                << " price=" << price << " shares=" << shares
+                << " base=" << bids_.base_price()
+                << " max=" << (bids_.base_price() + (LevelArr::MAX_LEVELS - 1) * PRICE_TICK)
+                << " ref=" << ref << '\n';
       return;
+    }
     orders_.insert(ref, price, shares, side);
     PriceLevel &lvl = bids_.at(price);
     lvl.total_shares += shares;
@@ -123,8 +135,14 @@ void OrderBook::on_add(OrderRef ref, common::Side side, Price price,
     if (price > tob_.best_bid)
       tob_.best_bid = price;
   } else {
-    if (!asks_.in_range(price))
+    if (!asks_.in_range(price)) {
+      std::cout << "DROP add stock=" << stock_id_ << " side=S"
+                << " price=" << price << " shares=" << shares
+                << " base=" << asks_.base_price()
+                << " max=" << (asks_.base_price() + (LevelArr::MAX_LEVELS - 1) * PRICE_TICK)
+                << " ref=" << ref << '\n';
       return;
+    }
     orders_.insert(ref, price, shares, side);
     PriceLevel &lvl = asks_.at(price);
     lvl.total_shares += shares;
@@ -244,6 +262,12 @@ void OrderBook::on_replace(OrderRef old_ref, OrderRef new_ref, Price new_price,
       ++new_lvl.order_count;
       if (new_price > tob_.best_bid)
         tob_.best_bid = new_price;
+    } else {
+      std::cout << "DROP replace stock=" << stock_id_ << " side=B"
+                << " new_price=" << new_price << " new_shares=" << new_shares
+                << " base=" << bids_.base_price()
+                << " max=" << (bids_.base_price() + (LevelArr::MAX_LEVELS - 1) * PRICE_TICK)
+                << " old_ref=" << old_ref << " new_ref=" << new_ref << '\n';
     }
     if (old_lvl.order_count == 0)
       rescan(common::Side::Buy, old_price);
@@ -259,6 +283,12 @@ void OrderBook::on_replace(OrderRef old_ref, OrderRef new_ref, Price new_price,
       ++new_lvl.order_count;
       if (new_price < tob_.best_ask)
         tob_.best_ask = new_price;
+    } else {
+      std::cout << "DROP replace stock=" << stock_id_ << " side=S"
+                << " new_price=" << new_price << " new_shares=" << new_shares
+                << " base=" << asks_.base_price()
+                << " max=" << (asks_.base_price() + (LevelArr::MAX_LEVELS - 1) * PRICE_TICK)
+                << " old_ref=" << old_ref << " new_ref=" << new_ref << '\n';
     }
     if (old_lvl.order_count == 0)
       rescan(common::Side::Sell, old_price);
@@ -284,9 +314,9 @@ int OrderBook::top_bids(Level *out, int max_out) const noexcept {
     const PriceLevel &lvl = bids_.at(p);
     if (lvl.order_count > 0)
       out[n++] = {p, lvl.total_shares};
-    if (p == 0)
+    if (p < PRICE_TICK)
       break;
-    --p;
+    p -= PRICE_TICK;
   }
   return n;
 }
@@ -300,7 +330,7 @@ int OrderBook::top_asks(Level *out, int max_out) const noexcept {
     const PriceLevel &lvl = asks_.at(p);
     if (lvl.order_count > 0)
       out[n++] = {p, lvl.total_shares};
-    ++p;
+    p += PRICE_TICK;
   }
   return n;
 }
