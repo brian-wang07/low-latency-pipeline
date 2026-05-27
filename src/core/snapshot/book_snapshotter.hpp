@@ -38,7 +38,7 @@ void run_snapshotter(BookSeqlock<depth> &src, int pin_core,
     if (local.event_seq == 0)
       continue;
     // publish
-    // cb(local);
+    cb(local);
   }
 }
 

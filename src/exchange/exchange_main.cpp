@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
   if (!pin_to_core(2))
     std::perror("pin_to_core exchange");
 
-  ItchParser parser{data_fd, &p->exchange_to_core};
+  ItchParser parser{data_fd, &p->exchange_to_core, &shutdown_flag};
   while (!parser.done() && !shutdown_flag) {
     parser.next();
     std::this_thread::sleep_for(std::chrono::nanoseconds(1));

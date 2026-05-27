@@ -13,8 +13,9 @@
 #include "exchange/itch/itch_event_types.hpp"
 #include "exchange/itch/itch_parser.hpp"
 
-ItchParser::ItchParser(int fd, core::CoreRing *ring) noexcept
-    : fd_(fd), ring_(ring) {
+ItchParser::ItchParser(int fd, core::CoreRing *ring,
+                       const volatile std::sig_atomic_t *shutdown) noexcept
+    : fd_(fd), ring_(ring), shutdown_(shutdown) {
 
   fstat(fd_, &fs_);
   data_ = (const uint8_t *)mmap(nullptr, fs_.st_size, PROT_READ, MAP_PRIVATE,
@@ -39,6 +40,8 @@ void ItchParser::next() {
   uint64_t tail = ring_->tail.load(std::memory_order_relaxed);
   while (tail - ring_->head.load(std::memory_order_acquire) >=
          exchange::EXCHANGE_RING_CAPACITY) {
+    if (shutdown_ && *shutdown_)
+      return;
     SPIN_PAUSE();
   }
 

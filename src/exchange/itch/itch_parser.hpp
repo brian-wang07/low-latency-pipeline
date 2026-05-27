@@ -1,6 +1,6 @@
 #pragma once
 
-#include <array>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -12,7 +12,8 @@
 
 class ItchParser {
 public:
-  ItchParser(int fd, core::CoreRing *ring) noexcept;
+  ItchParser(int fd, core::CoreRing *ring,
+             const volatile std::sig_atomic_t *shutdown = nullptr) noexcept;
   void next();
   bool done() const noexcept { return cursor_ >= end_; }
 
@@ -41,6 +42,7 @@ private:
 
   int fd_;
   core::CoreRing *ring_;
+  const volatile std::sig_atomic_t *shutdown_;
   struct stat fs_;
   const uint8_t *data_;
   const uint8_t *cursor_;

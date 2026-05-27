@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/event.hpp"
-#include <climits>
 #include <cstdint>
 #include <memory>
 

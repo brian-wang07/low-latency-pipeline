@@ -16,9 +16,17 @@
 #include "common/platform/cpu_pin.hpp"
 #include "common/platform/spin_pause.hpp"
 #include "common/platform/tsc.hpp"
+#include "common/seqlock.hpp"
 #include "core/core.hpp"
 #include "core/snapshot/book_snapshot.hpp"
 #include "core/snapshot/book_snapshotter.hpp"
+
+struct LatencyStats {
+  common::Histogram transit;
+  common::Histogram process;
+  common::Histogram e2e;
+};
+static_assert(std::is_trivially_copyable_v<LatencyStats>);
 
 static volatile std::sig_atomic_t shutdown_flag{0};
 static void on_signal(int) { shutdown_flag = 1; }
@@ -169,11 +177,26 @@ int main(int argc, char **argv) {
                                  render);
   });
 
+  // Hot thread publishes cumulative histograms here; dumper thread reads.
+  static common::Seqlock<LatencyStats> lat_seq;
+  std::atomic<bool> lat_shutdown{false};
+  std::thread lat_thread([&] {
+    LatencyStats local{};
+    while (!lat_shutdown.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (lat_seq.try_load(local) && local.e2e.count > 0) {
+        local.transit.dump(lat_log, "transit", tsc_per_ns);
+        local.process.dump(lat_log, "process", tsc_per_ns);
+        local.e2e.dump(lat_log, "e2e", tsc_per_ns);
+      }
+    }
+  });
+
   common::Event ev;
   common::Histogram hist_ipc;
   common::Histogram hist_core;
   common::Histogram hist_e2e;
-  constexpr uint64_t HIST_MASK = (1ull << 16) - 1; // 65k events
+  constexpr uint64_t PUB_MASK = (1ull << 16) - 1; // publish every 65k events
   constexpr uint64_t MAX_EVENTS = 20'000'000;
   uint64_t n{0};
   while (!shutdown_flag && n < MAX_EVENTS) {
@@ -184,15 +207,17 @@ int main(int argc, char **argv) {
       hist_ipc.record(t1 - ev.tsc_in);
       hist_core.record(t3 - t1);
       hist_e2e.record(t3 - ev.tsc_in);
-      if ((++n & HIST_MASK) == 0) {
-        hist_ipc.dump(lat_log, "transit", tsc_per_ns);
-        hist_core.dump(lat_log, "process", tsc_per_ns);
-        hist_e2e.dump(lat_log, "e2e", tsc_per_ns);
+      if ((++n & PUB_MASK) == 0) {
+        LatencyStats snap{hist_ipc, hist_core, hist_e2e};
+        lat_seq.store(snap);
       }
     }
   }
   while (ring->try_pop(ev))
     process(ev);
+
+  lat_shutdown.store(true, std::memory_order_release);
+  lat_thread.join();
 
   snap_shutdown.store(true, std::memory_order_release);
   snap_thread.join();
