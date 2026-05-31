@@ -59,6 +59,7 @@ def plot(sections, out=None):
 
     fig.tight_layout()
     if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out, dpi=150)
         print(f"saved {out}")
     else:
@@ -69,8 +70,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("log", nargs="?", default="build/latency.log", type=Path,
                     help="path to latency.log (default: build/latency.log)")
-    ap.add_argument("-o", "--out", type=Path,
-                    help="output image path; if omitted, show interactively")
+    ap.add_argument("-o", "--out", type=Path, default=Path("build/latency.png"),
+                    help="output image path (default: build/latency.png)")
     args = ap.parse_args()
 
     if not args.log.exists():

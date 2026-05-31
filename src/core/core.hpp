@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/event.hpp"
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -9,6 +10,12 @@ namespace core::equity {
 using Price = uint32_t; // 4 decimal fixed point
 using Qty = uint32_t;
 using OrderRef = uint64_t;
+
+// Count of orders dropped because their price fell outside the level array's
+// range. Bumped on the hot path (relaxed); read by the latency dumper thread.
+// Replaces the std::cout DROP logging, which took an internal mutex and could
+// stall the hot path for hundreds of microseconds.
+extern std::atomic<uint64_t> g_drops;
 
 // min tick size is $0.01; prices come in at 4 decimal point accuracy, so scale by this much 
 inline constexpr Price PRICE_TICK = 100;
@@ -137,6 +144,12 @@ private:
 
 struct BookArray {
   std::unique_ptr<OrderBook> books_[65536];
+  std::unique_ptr<OrderBook> spare_;
+
+  // Allocate and fault in a spare OrderBook ahead of the hot loop so the first
+  // event for the primary symbol doesn't pay the ~40MB allocation + zero-init +
+  // page-fault cost inline. ensure() adopts the spare on first use.
+  void prewarm() noexcept;
 
   OrderBook &ensure(uint16_t locate, uint64_t stock_id,
                     Price base_price) noexcept;

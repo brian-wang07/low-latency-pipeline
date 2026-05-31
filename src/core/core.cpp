@@ -1,11 +1,15 @@
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 
 #include "common/event.hpp"
 #include "core.hpp"
 
 using namespace core::equity;
+
+namespace core::equity {
+std::atomic<uint64_t> g_drops{0};
+} // namespace core::equity
 
 // OrderMap
 template <uint32_t Capacity>
@@ -121,11 +125,7 @@ void OrderBook::on_add(OrderRef ref, common::Side side, Price price,
                        Qty shares) noexcept {
   if (side == common::Side::Buy) {
     if (!bids_.in_range(price)) {
-      std::cout << "DROP add stock=" << stock_id_ << " side=B"
-                << " price=" << price << " shares=" << shares
-                << " base=" << bids_.base_price()
-                << " max=" << (bids_.base_price() + (LevelArr::MAX_LEVELS - 1) * PRICE_TICK)
-                << " ref=" << ref << '\n';
+      g_drops.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     orders_.insert(ref, price, shares, side);
@@ -136,11 +136,7 @@ void OrderBook::on_add(OrderRef ref, common::Side side, Price price,
       tob_.best_bid = price;
   } else {
     if (!asks_.in_range(price)) {
-      std::cout << "DROP add stock=" << stock_id_ << " side=S"
-                << " price=" << price << " shares=" << shares
-                << " base=" << asks_.base_price()
-                << " max=" << (asks_.base_price() + (LevelArr::MAX_LEVELS - 1) * PRICE_TICK)
-                << " ref=" << ref << '\n';
+      g_drops.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     orders_.insert(ref, price, shares, side);
@@ -263,11 +259,7 @@ void OrderBook::on_replace(OrderRef old_ref, OrderRef new_ref, Price new_price,
       if (new_price > tob_.best_bid)
         tob_.best_bid = new_price;
     } else {
-      std::cout << "DROP replace stock=" << stock_id_ << " side=B"
-                << " new_price=" << new_price << " new_shares=" << new_shares
-                << " base=" << bids_.base_price()
-                << " max=" << (bids_.base_price() + (LevelArr::MAX_LEVELS - 1) * PRICE_TICK)
-                << " old_ref=" << old_ref << " new_ref=" << new_ref << '\n';
+      g_drops.fetch_add(1, std::memory_order_relaxed);
     }
     if (old_lvl.order_count == 0)
       rescan(common::Side::Buy, old_price);
@@ -284,11 +276,7 @@ void OrderBook::on_replace(OrderRef old_ref, OrderRef new_ref, Price new_price,
       if (new_price < tob_.best_ask)
         tob_.best_ask = new_price;
     } else {
-      std::cout << "DROP replace stock=" << stock_id_ << " side=S"
-                << " new_price=" << new_price << " new_shares=" << new_shares
-                << " base=" << asks_.base_price()
-                << " max=" << (asks_.base_price() + (LevelArr::MAX_LEVELS - 1) * PRICE_TICK)
-                << " old_ref=" << old_ref << " new_ref=" << new_ref << '\n';
+      g_drops.fetch_add(1, std::memory_order_relaxed);
     }
     if (old_lvl.order_count == 0)
       rescan(common::Side::Sell, old_price);
@@ -339,11 +327,23 @@ uint64_t OrderBook::stock_id() const noexcept { return stock_id_; }
 bool OrderBook::initialized() const noexcept { return initialized_; }
 
 // BookArray
+void BookArray::prewarm() noexcept {
+  if (!spare_)
+    spare_ = std::make_unique<OrderBook>();
+  // The default constructor already zero-initializes every Slot / PriceLevel,
+  // which writes (and thus faults in) every page. Touch it once more anyway to
+  // be explicit and defeat any lazy-commit cleverness.
+  volatile char *bytes = reinterpret_cast<volatile char *>(spare_.get());
+  for (std::size_t off = 0; off < sizeof(OrderBook); off += 4096)
+    bytes[off];
+}
+
 OrderBook &BookArray::ensure(uint16_t locate, uint64_t stock_id,
                              Price base_price) noexcept {
   auto &slot = books_[locate];
   if (!slot) {
-    slot = std::make_unique<OrderBook>();
+    // Adopt the prewarmed book if available; otherwise allocate inline.
+    slot = spare_ ? std::move(spare_) : std::make_unique<OrderBook>();
     slot->init(stock_id, base_price);
   }
   return *slot;

@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 
+#include "common/config.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
 #include "common/platform/cpu_pin.hpp"
@@ -44,7 +45,7 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 
-  if (!pin_to_core(2))
+  if (!pin_to_core(config::EXCHANGE_CORE))
     std::perror("pin_to_core exchange");
 
   ItchParser parser{data_fd, &p->exchange_to_core, &shutdown_flag};

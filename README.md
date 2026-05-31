@@ -157,6 +157,9 @@ sudo reboot
 - `nohz_full=2,4` — kills the periodic scheduler tick on those cores while a single task is running. Eliminates ~250 Hz of timer-induced jitter per core.
 - `rcu_nocbs=2,4` — offloads RCU callbacks to other CPUs so our hot path never gets preempted by RCU bookkeeping.
 
+
+
+
 ## verification
 
 While the pipeline is running:
@@ -186,3 +189,31 @@ sudo cyclictest -m -p 99 -t1 -a 2 -i 200 -l 100000
 
 Pins to core 2, runs 100 000 iterations at 200 µs nominal period, prints max/avg latency.
 
+## Interesting stuff to keep in mind
+- Logical cores vs Physical cores:
+On modern Intel processors, two or more "cores" may share the same L1 and L2 cache. Check this via:
+```
+lscpu -e=CPU, CORE
+CPU CORE
+  0    0
+  1    0
+  2    1
+  3    1
+  4    2
+  5    2
+  6    3
+  7    3
+  8    4
+  9    4
+ 10    5
+ 11    5
+```
+Essentially, cpu 0 and 1 share core 0, cpu 2 and 3 share core 1, and so on. Thus, when pinning IRQ tasks to cores off the hot path, make sure to exclude sibling cpus: 
+```
+irqaffinity=0,1,6,7,8,9,10,11
+```
+As well, isolating cpu 3 and 5 could also improve performance.
+- turbostat: run with:
+```
+sudo turbostat --show Core,CPU,Busy%,Bzy_MHz,IRQ,SMI,LLC%hit,C1E%,C6%,C8%,C10%
+```

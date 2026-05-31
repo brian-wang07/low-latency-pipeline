@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 
+#include "common/config.hpp"
 #include "common/histogram.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
@@ -33,8 +34,6 @@ static void on_signal(int) { shutdown_flag = 1; }
 
 static constexpr char PRIMARY[8] = {'N', 'V', 'D', 'A', ' ', ' ', ' ', ' '};
 static constexpr std::size_t DEPTH = 15;
-static constexpr int HOT_CORE = 4;
-static constexpr int SNAPSHOT_CORE = 5;
 
 // Snapshotter callback. Runs on the snapshotter thread only. Temporary
 // stand-in until the dashboard process consumes from an SPSC ring.
@@ -87,7 +86,7 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 
-  if (!pin_to_core(HOT_CORE))
+  if (!pin_to_core(config::HOT_CORE))
     std::perror("pin_to_core hot");
 
   // calibrate
@@ -95,7 +94,6 @@ int main(int argc, char **argv) {
   calibrate_tsc(tsc_per_ns);
 
   // Latency log. Path overridable per-run via LAT_LOG=foo.log ./core ...
-  // Line-buffered so `tail -f` shows new dumps live.
   const char *lat_log_path = std::getenv("LAT_LOG");
   if (!lat_log_path)
     lat_log_path = "latency.log";
@@ -104,12 +102,13 @@ int main(int argc, char **argv) {
     std::perror("fopen latency log");
     return 1;
   }
-  std::setvbuf(lat_log, nullptr, _IOLBF, 0);
+  static char lat_log_buf[1 << 16];
+  std::setvbuf(lat_log, lat_log_buf, _IOFBF, sizeof(lat_log_buf));
 
   static core::equity::BookArray engine;
+  engine.prewarm();
 
   // In-process bridge between hot thread (writer) and snapshotter thread
-  // (reader). Not in shm — both threads live in this process.
   static core::BookSeqlock<DEPTH> book_seq;
   core::BookSnapshot<DEPTH> scratch{};
 
@@ -172,7 +171,7 @@ int main(int argc, char **argv) {
   // snapshot thread
   std::atomic<bool> snap_shutdown{false};
   std::thread snap_thread([&] {
-    core::run_snapshotter<DEPTH>(book_seq, SNAPSHOT_CORE,
+    core::run_snapshotter<DEPTH>(book_seq, config::SNAPSHOT_CORE,
                                  std::chrono::milliseconds(33), snap_shutdown,
                                  render);
   });
@@ -181,6 +180,8 @@ int main(int argc, char **argv) {
   static common::Seqlock<LatencyStats> lat_seq;
   std::atomic<bool> lat_shutdown{false};
   std::thread lat_thread([&] {
+    if (!pin_to_core(config::LAT_DUMP_CORE))
+      std::perror("pin_to_core lat dump");
     LatencyStats local{};
     while (!lat_shutdown.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -188,6 +189,9 @@ int main(int argc, char **argv) {
         local.transit.dump(lat_log, "transit", tsc_per_ns);
         local.process.dump(lat_log, "process", tsc_per_ns);
         local.e2e.dump(lat_log, "e2e", tsc_per_ns);
+        std::fprintf(lat_log, "[drops] %llu\n",
+                     static_cast<unsigned long long>(core::equity::g_drops.load(
+                         std::memory_order_relaxed)));
       }
     }
   });
@@ -222,8 +226,10 @@ int main(int argc, char **argv) {
   snap_shutdown.store(true, std::memory_order_release);
   snap_thread.join();
 
-  std::fprintf(lat_log, "\n=== aggregated (n=%llu) ===\n",
-               static_cast<unsigned long long>(n));
+  std::fprintf(lat_log, "\n=== aggregated (n=%llu drops=%llu) ===\n",
+               static_cast<unsigned long long>(n),
+               static_cast<unsigned long long>(
+                   core::equity::g_drops.load(std::memory_order_relaxed)));
   hist_ipc.dump(lat_log, "transit", tsc_per_ns);
   hist_core.dump(lat_log, "process", tsc_per_ns);
   hist_e2e.dump(lat_log, "e2e", tsc_per_ns);
