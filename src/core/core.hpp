@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/event.hpp"
+#include "core/level_bitmap.hpp"
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -73,9 +74,20 @@ public:
   bool in_range(Price price) const noexcept;
   Price base_price() const noexcept;
 
+  // Occupancy tracking: flip a level's bit as its order_count crosses 0.
+  void mark_occupied(Price price) noexcept; // order_count 0 -> 1
+  void mark_empty(Price price) noexcept;    // order_count -> 0
+
+  // Nearest occupied level strictly beyond `price`, walking away from the book
+  // edge (above for asks, below for bids). Returns 0 when none remain in range;
+  // the caller maps that to its own empty-side sentinel.
+  Price next_occupied_above(Price price) const noexcept;
+  Price prev_occupied_below(Price price) const noexcept;
+
 private:
   Price base_price_{0};
   PriceLevel levels_[MaxLevels]{};
+  OccupancyBitmap<MaxLevels> occupied_;
 };
 
 struct TopOfBook {
@@ -83,8 +95,13 @@ struct TopOfBook {
   Price best_ask{UINT32_MAX};
 };
 
-// is this overkill?
 inline constexpr uint32_t DEFAULT_ORDER_CAPACITY = 1048576;
+// Level-array width: a 1048576 * $0.01 = $10485.76 window, centered on the
+// symbol's opening price (see base_price seeding in core_main). The occupancy
+// bitmap makes next/prev-level lookups O(tiers) no matter how much of the window
+// is empty, so width no longer costs traversal time — only memory (~8 MB per
+// side). Sized generously so live orders rarely fall outside it; the few that do
+// are dropped (g_drops), by design.
 inline constexpr uint32_t DEFAULT_LEVEL_COUNT = 1048576;
 
 class OrderBook {
@@ -132,7 +149,7 @@ public:
   bool initialized() const noexcept;
 
 private:
-  void rescan(common::Side side, Price price) noexcept;
+  void on_level_emptied(common::Side side, Price price) noexcept;
 
   bool initialized_{false};
   TopOfBook tob_;

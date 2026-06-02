@@ -56,6 +56,11 @@ add_executable(test_orderbook
 )
 target_include_directories(test_orderbook PRIVATE src)
 
+add_executable(test_level_bitmap
+    tests/test_level_bitmap.cpp
+)
+target_include_directories(test_level_bitmap PRIVATE src)
+
 add_executable(parse_to_orderbook
     tests/parse_to_orderbook.cpp
     src/exchange/itch/itch_parser.cpp

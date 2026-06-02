@@ -52,25 +52,27 @@ The engine in `src/core/` reconstructs a per-symbol limit order book from the IT
 - Golden-ratio multiplicative hash: ITCH refs are near-sequential and would collide badly with identity hashing.
 - No alignment padding: single-writer, no concurrent readers on this structure (readers go through the snapshot).
 
-**`PriceLevel`** — `{total_shares, order_count}` aggregate per price. Pre-aggregated so reads never traverse a per-price order list. `order_count` is kept separately because we need to detect the moment a level drains to trigger rescan.
+**`PriceLevel`** — `{total_shares, order_count}` aggregate per price. Pre-aggregated so reads never traverse a per-price order list. `order_count` is kept separately because we need to detect the moment a level drains — that 0-crossing clears the level's occupancy bit (below) and may move the top of book.
 
 **`PriceLevelArray<MaxLevels>`** — flat array of `PriceLevel`, indexed by `(price - base_price) / PRICE_TICK`. One per side. Chosen because:
 - O(1) random-access by price: one subtract-divide-load, vs O(log n) and pointer-chasing for `std::map`.
 - Zero allocation, no rebalancing.
-- Sequential memory layout makes `top_bids` / `top_asks` walks prefetcher-friendly.
-- Bucketed by cent (`PRICE_TICK = 100`) since Reg NMS forbids sub-penny pricing for stocks ≥ $1 — costs nothing for normal equities and gives 100× more level range for the same memory. Window is $2621.44 wide.
+- Bucketed by cent (`PRICE_TICK = 100`) since Reg NMS forbids sub-penny pricing for stocks ≥ $1 — costs nothing for normal equities and gives 100× more level range for the same memory. Window is `DEFAULT_LEVEL_COUNT` × $0.01 = $10485.76 wide, centered on the symbol's opening price — wide enough that live orders almost never fall outside it.
+- Most levels sit empty, so a naive `top_bids` / `top_asks` would step from the top of book across that dead span one tick at a time — a multi-millisecond scan for a window this wide. The companion `OccupancyBitmap` (next) removes the walk, which is what lets the window be sized for coverage instead of kept narrow to bound the scan.
 
-The trade-off is the fixed window. `base_price` is seeded from the first add for a symbol minus a small offset; out-of-range adds are silently dropped (and currently logged to stdout while we tune).
+The trade-off is the fixed window. `base_price` is seeded from the first add for a symbol minus a small offset; out-of-range adds are silently dropped and counted in `g_drops`.
 
-**`TopOfBook`** — `{best_bid, best_ask}` cache. Without it, every TOB query would scan the level array. Maintained incrementally: `on_add` updates with a single compare-store, `rescan` only runs when a level drains. Sentinel values (`0` and `UINT32_MAX`) naturally lose the first comparison so the first real order always wins.
+**`OccupancyBitmap<MaxLevels>`** — a hierarchical (radix-64) bitmap, one bit per price level, set iff that level has live orders. Each tier keeps one summary bit per 64-bit word of the tier below, so it's a tree of fan-out 64 (three to four tiers at these level counts). `next_set` / `prev_set` find the nearest populated level in O(tiers) word-loads via `__builtin_ctzll`/`clzll`, instead of scanning the empty span between levels. This is what lets `top_bids`/`top_asks` and the top-of-book update skip dead levels structurally, and what decouples walk cost from window width — widen the window for fewer drops without lengthening any scan.
 
-**`OrderBook`** — composes `TopOfBook` + two `PriceLevelArray`s + one `OrderMap` for a single symbol. ~10 MB. Non-copyable.
+**`TopOfBook`** — `{best_bid, best_ask}` cache. Without it, every TOB query would scan the level array. Maintained incrementally: `on_add` updates with a single compare-store; when a level drains, `on_level_emptied` clears its bit and, if it was the top, uses the bitmap's `next_set`/`prev_set` to drop to the next populated level. Sentinel values (`0` and `UINT32_MAX`) naturally lose the first comparison so the first real order always wins.
 
-**`BookArray`** — `unique_ptr<OrderBook>[65536]` indexed by ITCH `stock_locate` (the 16-bit per-symbol id assigned at SoD). Direct array index = O(1) symbol lookup at the very top of the hot path, no hashing or string compare. `unique_ptr` so the 10 MB per book only allocates for symbols actually seen.
+**`OrderBook`** — composes `TopOfBook` + two `PriceLevelArray`s (each with its `OccupancyBitmap`) + one `OrderMap` for a single symbol. ~40 MB. Non-copyable.
+
+**`BookArray`** — `unique_ptr<OrderBook>[65536]` indexed by ITCH `stock_locate` (the 16-bit per-symbol id assigned at SoD). Direct array index = O(1) symbol lookup at the very top of the hot path, no hashing or string compare. `unique_ptr` so the ~40 MB per book only allocates for symbols actually seen.
 
 **`BookSnapshot<depth>` + `BookSeqlock<depth>`** — the publish boundary. Snapshot is a POD frame (TOB + top N levels per side). The seqlock ships it lock-free from the writer thread to the snapshotter; readers retry on torn reads. This decouples the single-writer hot path from any reader's pace.
 
-Overall shape: **hash for "find this order"**, **two arrays for "find this price level"**, **cached pair for "find best price"**, **outer array for "find this symbol"**, **seqlock + POD frame for "ship state out"**. Direct indexing where the key space is small and dense, hashing where it's large and sparse.
+Overall shape: **hash for "find this order"**, **two arrays for "find this price level"**, **bitmap for "find the next populated level"**, **cached pair for "find best price"**, **outer array for "find this symbol"**, **seqlock + POD frame for "ship state out"**. Direct indexing where the key space is small and dense, hashing where it's large and sparse.
 
 ## hugepages
 

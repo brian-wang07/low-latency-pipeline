@@ -124,6 +124,11 @@ int main(int argc, char **argv) {
       // Subscription gate: only A/F carries the stock symbol on the wire.
       if (std::memcmp(ev.stock, PRIMARY, 8) != 0)
         return;
+      // Seed base_price below the symbol's first price so the in-range window
+      // brackets where the book will trade; adds outside it are dropped. The
+      // occupancy bitmap makes walk cost independent of where the populated
+      // range sits, so this only sets the drop boundary, not performance. For
+      // symbols cheaper than HALF the window, base clamps to 0.
       constexpr uint32_t HALF =
           core::equity::DEFAULT_LEVEL_COUNT / 2 * core::equity::PRICE_TICK;
       core::equity::Price base = ev.price > HALF ? ev.price - HALF : 0u;
