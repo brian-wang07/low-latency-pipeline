@@ -60,7 +60,11 @@ template <typename T, uint32_t capacity> struct alignas(64) SpscRing {
   }
 
   uint32_t size() const noexcept {
-
+    // May be called by a third party (e.g. the dashboard), so head and tail are
+    // sampled at different instants.
+    uint32_t h = head.load(std::memory_order_acquire);
+    uint32_t t = tail.load(std::memory_order_acquire);
+    return t - h;
   };
 };
 

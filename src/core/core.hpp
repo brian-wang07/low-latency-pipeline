@@ -112,6 +112,7 @@ public:
   struct Level {
     Price price;
     Qty shares;
+    uint32_t order_count;
   };
 
   OrderBook() = default;

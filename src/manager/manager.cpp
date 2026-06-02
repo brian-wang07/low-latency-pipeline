@@ -23,6 +23,7 @@ struct WorkerSpec {
 static constexpr WorkerSpec WORKERS[] = {
     {"./exchange_main", "../itch_feed/S071321-v50.txt"},
     {"./core_main", nullptr},
+    {"./dashboard", nullptr},
 };
 
 static pid_t spawn(const WorkerSpec &w, int shm_fd, pid_t parent_pid) {

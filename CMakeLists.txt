@@ -43,6 +43,60 @@ add_compile_options(-Wall -Wextra)
 
 find_package(Threads REQUIRED)
 
+# ─────────────────────────────────────────────────────────────────────────
+# GUI toolchain for the dashboard process: Dear ImGui + ImPlot + GLFW/OpenGL.
+# ImGui/ImPlot ship as plain sources (no CMake target), so we fetch and build
+# them into static libs ourselves. JetBrainsMono supplies the UI font.
+# ─────────────────────────────────────────────────────────────────────────
+include(FetchContent)
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.6
+)
+FetchContent_MakeAvailable(imgui)
+
+FetchContent_Declare(
+    implot
+    GIT_REPOSITORY https://github.com/epezent/implot.git
+    GIT_TAG        v0.16
+)
+FetchContent_MakeAvailable(implot)
+
+FetchContent_Declare(
+    jetbrains_mono
+    GIT_REPOSITORY https://github.com/JetBrains/JetBrainsMono.git
+    GIT_TAG        v2.304
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(jetbrains_mono)
+
+find_package(glfw3 3.3 REQUIRED)
+find_package(OpenGL REQUIRED)
+
+add_library(imgui_lib STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(imgui_lib PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
+target_compile_options(imgui_lib PRIVATE -w) # vendored: drop -Wall/-Wextra noise
+
+add_library(implot_lib STATIC
+    ${implot_SOURCE_DIR}/implot.cpp
+    ${implot_SOURCE_DIR}/implot_items.cpp
+)
+target_include_directories(implot_lib PUBLIC ${implot_SOURCE_DIR})
+target_link_libraries(implot_lib PUBLIC imgui_lib)
+target_compile_options(implot_lib PRIVATE -w)
+
 add_executable(test_itch_parser
     tests/test_itch_parser.cpp
     src/exchange/itch/itch_parser.cpp
@@ -91,3 +145,13 @@ add_executable(core_main
 )
 target_include_directories(core_main PRIVATE src)
 target_link_libraries(core_main PRIVATE Threads::Threads)
+
+add_executable(dashboard
+    src/dashboard/dashboard_main.cpp
+    src/common/ipc/shm_segment.cpp
+)
+target_include_directories(dashboard PRIVATE src)
+target_link_libraries(dashboard PRIVATE Threads::Threads imgui_lib implot_lib)
+target_compile_definitions(dashboard PRIVATE
+    JETBRAINS_MONO_FONT="${jetbrains_mono_SOURCE_DIR}/fonts/ttf/JetBrainsMono-Regular.ttf"
+)

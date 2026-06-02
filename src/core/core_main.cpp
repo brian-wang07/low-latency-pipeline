@@ -12,6 +12,7 @@
 
 #include "common/config.hpp"
 #include "common/histogram.hpp"
+#include "common/ipc/dashboard_snapshot.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
 #include "common/platform/cpu_pin.hpp"
@@ -32,34 +33,115 @@ static_assert(std::is_trivially_copyable_v<LatencyStats>);
 static volatile std::sig_atomic_t shutdown_flag{0};
 static void on_signal(int) { shutdown_flag = 1; }
 
-static constexpr char PRIMARY[8] = {'N', 'V', 'D', 'A', ' ', ' ', ' ', ' '};
-static constexpr std::size_t DEPTH = 15;
+static constexpr char PRIMARY[8] = {'T', 'Q', 'Q', 'Q', ' ', ' ', ' ', ' '};
 
-// Snapshotter callback. Runs on the snapshotter thread only. Temporary
-// stand-in until the dashboard process consumes from an SPSC ring.
-static void render(const core::BookSnapshot<DEPTH> &snap) {
-  std::fputs("\033[H\033[2J", stdout);
-  std::printf("%.8s  events=%lu\n\n", snap.stock_id,
-              static_cast<unsigned long>(snap.event_seq));
-  std::printf("%12s %12s   ||   %-12s %-12s\n", "Bid Qty", "Bid Price",
-              "Ask Price", "Ask Qty");
-  std::printf("%12s %12s   ||   %-12s %-12s\n", "------------", "------------",
-              "------------", "------------");
-  for (std::size_t i = 0; i < DEPTH; ++i) {
-    if (static_cast<int>(i) < snap.nb)
-      std::printf("%12u %12.4f", snap.bids[i].shares,
-                  snap.bids[i].price / 10000.0);
-    else
-      std::printf("%12s %12s", "", "");
-    std::fputs("   ||   ", stdout);
-    if (static_cast<int>(i) < snap.na)
-      std::printf("%-12.4f %-12u\n", snap.asks[i].price / 10000.0,
-                  snap.asks[i].shares);
-    else
-      std::printf("%-12s %-12s\n", "", "");
+// Book-frame depth is tied to the dashboard wire contract so the publisher can
+// copy levels 1:1 into the shared-ring frame.
+static constexpr std::size_t DEPTH = dashboard::DASH_DEPTH;
+
+// Snapshotter callback. Runs on the snapshotter thread only (off the hot path).
+// Converts the in-process book frame into a dashboard::Snapshot, derives the
+// display analytics + pipeline-health metrics, and publishes to the shared
+// core->dashboard ring. Drops the frame when the ring is full (the dashboard
+// drains at ~60fps vs. our ~30Hz publish rate, so this is rare and harmless).
+struct DashboardPublisher {
+  dashboard::DashboardRing *out;      // producer end of the shared ring
+  const core::CoreRing *in;           // input ring, read for occupancy only
+  common::Seqlock<LatencyStats> *lat; // e2e latency source (multi-reader)
+  double tsc_per_ns;
+
+  // EMA smoothing per snapshot frame (~30Hz) -> ~0.7s time constant.
+  static constexpr double EMA_ALPHA = 0.05;
+
+  // running state carried across frames
+  bool have_prev = false;
+  uint64_t prev_seq = 0;
+  std::chrono::steady_clock::time_point prev_t{};
+  bool ema_init = false;
+  double ema = 0.0;
+
+  void operator()(const core::BookSnapshot<DEPTH> &s) noexcept {
+    dashboard::Snapshot<DEPTH> f{};
+
+    f.event_seq = s.event_seq;
+    std::memcpy(f.stock_id, s.stock_id, 8);
+    f.best_bid = s.best_bid;
+    f.best_ask = s.best_ask;
+    f.nb = s.nb;
+    f.na = s.na;
+
+    const bool have_bid = s.nb > 0 && s.best_bid != 0u;
+    const bool have_ask = s.na > 0 && s.best_ask != UINT32_MAX;
+    f.spread = (have_bid && have_ask && s.best_ask >= s.best_bid)
+                   ? (s.best_ask - s.best_bid)
+                   : 0u;
+
+    uint64_t tot_bid = 0, tot_ask = 0;
+    for (int i = 0; i < s.nb; ++i) {
+      f.bids[i] = {s.bids[i].price, s.bids[i].shares, s.bids[i].order_count};
+      tot_bid += s.bids[i].shares;
+    }
+    for (int i = 0; i < s.na; ++i) {
+      f.asks[i] = {s.asks[i].price, s.asks[i].shares, s.asks[i].order_count};
+      tot_ask += s.asks[i].shares;
+    }
+    f.total_bid_qty = tot_bid;
+    f.total_ask_qty = tot_ask;
+
+    // depth imbalance over captured levels, in [-1, 1]
+    const double tot = double(tot_bid) + double(tot_ask);
+    f.imbalance = tot > 0.0 ? (double(tot_bid) - double(tot_ask)) / tot : 0.0;
+
+    // volume-weighted mid (microprice): best prices weighted by the *opposite*
+    // side's size, so it leans toward the thinner side. Display units.
+    const double bid_px = dashboard::to_display(s.best_bid);
+    const double ask_px = dashboard::to_display(s.best_ask);
+    double vwmid;
+    if (have_bid && have_ask) {
+      const double bq = double(s.bids[0].shares);
+      const double aq = double(s.asks[0].shares);
+      const double q = bq + aq;
+      vwmid =
+          q > 0.0 ? (bid_px * aq + ask_px * bq) / q : (bid_px + ask_px) * 0.5;
+    } else if (have_bid) {
+      vwmid = bid_px;
+    } else if (have_ask) {
+      vwmid = ask_px;
+    } else {
+      vwmid = 0.0;
+    }
+    f.vwmid = vwmid;
+
+    // EMA of the vwmid across frames (display units)
+    if (have_bid || have_ask) {
+      ema = ema_init ? EMA_ALPHA * vwmid + (1.0 - EMA_ALPHA) * ema : vwmid;
+      ema_init = true;
+    }
+    f.ema = ema;
+
+    // tick rate: change in cumulative event count over wall time between frames
+    const auto now = std::chrono::steady_clock::now();
+    if (have_prev) {
+      const double dt = std::chrono::duration<double>(now - prev_t).count();
+      if (dt > 0.0)
+        f.tick_rate = double(s.event_seq - prev_seq) / dt;
+    }
+    prev_t = now;
+    prev_seq = s.event_seq;
+    have_prev = true;
+
+    // pipeline health: input-ring fill ratio + e2e latency percentiles
+    const double occ = double(in->size()) / double(core::CORE_RING_CAPACITY);
+    f.ring_occupancy = occ > 1.0 ? 1.0 : occ;
+    LatencyStats ls;
+    if (lat->try_load(ls) && ls.e2e.count > 0) {
+      f.latency_p99_ns = double(ls.e2e.percentile_cycles(0.99)) / tsc_per_ns;
+      f.latency_p999_ns = double(ls.e2e.percentile_cycles(0.999)) / tsc_per_ns;
+    }
+
+    (void)out->try_push(f); // drop on full
   }
-  std::fflush(stdout);
-}
+};
 
 int main(int argc, char **argv) {
   if (argc != 2)
@@ -78,6 +160,7 @@ int main(int argc, char **argv) {
     std::abort();
 
   core::CoreRing *ring = &p->exchange_to_core;
+  dashboard::DashboardRing *dash_ring = &p->core_to_dashboard;
 
   struct sigaction sa{};
   sa.sa_handler = on_signal;
@@ -173,16 +256,19 @@ int main(int argc, char **argv) {
     book_seq.store(scratch);
   };
 
-  // snapshot thread
+  // Hot thread publishes cumulative histograms here; both the snapshotter (for
+  // the dashboard's latency panel) and the dumper thread read it.
+  static common::Seqlock<LatencyStats> lat_seq;
+
+  // snapshot thread: publishes dashboard frames to the shared ring at ~30Hz
   std::atomic<bool> snap_shutdown{false};
+  DashboardPublisher publisher{dash_ring, ring, &lat_seq, tsc_per_ns};
   std::thread snap_thread([&] {
     core::run_snapshotter<DEPTH>(book_seq, config::SNAPSHOT_CORE,
                                  std::chrono::milliseconds(33), snap_shutdown,
-                                 render);
+                                 publisher);
   });
 
-  // Hot thread publishes cumulative histograms here; dumper thread reads.
-  static common::Seqlock<LatencyStats> lat_seq;
   std::atomic<bool> lat_shutdown{false};
   std::thread lat_thread([&] {
     if (!pin_to_core(config::LAT_DUMP_CORE))
@@ -206,9 +292,11 @@ int main(int argc, char **argv) {
   common::Histogram hist_core;
   common::Histogram hist_e2e;
   constexpr uint64_t PUB_MASK = (1ull << 16) - 1; // publish every 65k events
-  constexpr uint64_t MAX_EVENTS = 20'000'000;
+  // constexpr uint64_t MAX_EVENTS = 20'000'000;
   uint64_t n{0};
-  while (!shutdown_flag && n < MAX_EVENTS) {
+  while (!shutdown_flag
+         // && n < MAX_EVENTS
+  ) {
     if (ring->try_pop(ev)) {
       uint64_t t1 = read_tsc();
       process(ev);

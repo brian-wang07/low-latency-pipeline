@@ -334,7 +334,8 @@ int OrderBook::top_bids(Level *out, int max_out) const noexcept {
   int n = 0;
   Price p = tob_.best_bid;
   while (n < max_out && p != 0) {
-    out[n++] = {p, bids_.at(p).total_shares};
+    const PriceLevel &lvl = bids_.at(p);
+    out[n++] = {p, lvl.total_shares, lvl.order_count};
     p = bids_.prev_occupied_below(p); // 0 ends the walk
   }
   return n;
@@ -344,7 +345,8 @@ int OrderBook::top_asks(Level *out, int max_out) const noexcept {
   int n = 0;
   Price p = tob_.best_ask;
   while (n < max_out && p != UINT32_MAX) {
-    out[n++] = {p, asks_.at(p).total_shares};
+    const PriceLevel &lvl = asks_.at(p);
+    out[n++] = {p, lvl.total_shares, lvl.order_count};
     Price next = asks_.next_occupied_above(p);
     p = next ? next : UINT32_MAX; // sentinel ends the walk
   }

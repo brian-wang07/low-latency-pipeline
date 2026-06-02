@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/event.hpp"
+#include "common/ipc/dashboard_snapshot.hpp"
 #include "common/spsc_ring.hpp"
 #include <atomic>
 #include <cstdint>
@@ -30,6 +31,18 @@ inline constexpr std::uint32_t CORE_RING_CAPACITY = 8192;
 using CoreRing = common::SpscRing<common::Event, CORE_RING_CAPACITY>;
 } // namespace core
 
+namespace dashboard {
+
+// book snapshot frames for the GUI
+// producer: core snapshotter thread, consumer: dashboard process
+// DASH_DEPTH is part of the wire contract: producer and consumer must agree.
+inline constexpr std::size_t DASH_DEPTH = 15;
+// small, since we publish events every 30hz and read 60hz
+inline constexpr std::uint32_t DASH_RING_CAPACITY = 64;
+using DashboardRing =
+    common::SpscRing<Snapshot<DASH_DEPTH>, DASH_RING_CAPACITY>;
+} // namespace dashboard
+
 namespace ipc {
 inline constexpr const char *SHM_NAME = "pipeline_shm";
 inline constexpr size_t SHM_SIZE = 16 * 1024 * 1024;
@@ -46,6 +59,9 @@ struct alignas(64) ShmHeader {
 struct alignas(64) PipelineShm {
   ShmHeader header;
   core::CoreRing exchange_to_core;
+  dashboard::DashboardRing core_to_dashboard;
 };
+
+static_assert(sizeof(PipelineShm) <= SHM_SIZE);
 
 } // namespace ipc
