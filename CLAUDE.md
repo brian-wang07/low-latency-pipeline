@@ -10,7 +10,8 @@ plus an ImGui dashboard. The next phase (see `plan.md`) adds live crypto trading
 cmake -S . -B build && cmake --build build -j8     # Release by default
 cd build && ctest -LE slow                         # fast unit tests
 cd build && ctest -L slow                          # full-feed replays, ~30 s each
-cd build && ./manager                              # runs the whole pipeline
+cd build && ./manager ../configs/itch-null.cfg     # runs the whole pipeline
+scripts/loopback_test.sh                           # end-to-end NullRouter checks, ~4 min
 ```
 
 - Tests are standalone executables using the `CHECK` macro from `tests/check.hpp`, registered
@@ -20,9 +21,15 @@ cd build && ./manager                              # runs the whole pipeline
   change, with a note in the test (and a VERSION bump for released layouts).
 - Running `./manager` from a tool: start it with `setsid` (it SIGTERMs its own process group)
   and find workers with `pidof`, not `pgrep -f`, which also matches the calling shell.
-- Run binaries from `build/`: the manager execs `./exchange_main`, `./core_main`,
-  `./exec_main_$EXEC_STRATEGY` (default `logging`) and `./dashboard`, and the feed path is
-  hardcoded as `../itch_feed/S071321-v50.txt`.
+- Run binaries from `build/`. The manager takes a `.cfg` (`configs/itch-null.cfg` is the
+  default; keys: `feed_path`, `symbols`, `max_events`, `strategy`, `dashboard`, `cores.*`,
+  `risk.*`, `rate.*`/`kraken.*`, `null.balance.*`, `exec.*`, `auto_restart_exec`) and passes
+  `--config=` to every worker. A repeated key overrides an earlier one, so a run variant is a
+  copy of a cfg with lines appended (as `loopback_test.sh` does).
+- `strategy=builtin:<name>` runs `./exec_main_<name>`; `strategy=./strategy_<name>.so` runs
+  the generic `./exec_main`, which loads the module. To switch strategy without touching
+  core_main: edit `strategy=` and `kill -USR1 <manager>`, or use the dashboard's swap field
+  (exec exits 75 and the manager respawns it). exec writes `strategy_stats.log` on exit.
 - Shared memory is a 16 MiB memfd from the hugepage pool; needs `vm.nr_hugepages=20` and
   `vm.hugetlb_shm_group=1000` (see README). This machine has both configured.
 
@@ -31,21 +38,23 @@ cd build && ./manager                              # runs the whole pipeline
 core_main writes latency histograms to `build/latency.log` (override with `LAT_LOG=`).
 `scripts/plot_latency.py [log] -o out.png` plots them. Each benchmark is recorded in
 `benchmarks/benchmarks.md` under its commit hash with a plot in `benchmarks/plots/<hash>.png`
-(20M messages, NVDA). The committed core_main has the 20M cap commented out and PRIMARY =
-TQQQ; to benchmark, locally uncomment `MAX_EVENTS` (and its loop condition), set PRIMARY to
-NVDA, run `EXEC_STRATEGY=logging ./manager` (exit code 1 at the cap is expected), then revert.
+(20M messages, NVDA): run `./manager ../configs/bench.cfg` from build/ (logging strategy,
+`max_events=20_000_000`; exit code 0 at the cap). No source edits are needed any more.
 Standard conditions: fresh boot, no other processes running, and the feed warmed into page
 cache first with `cat itch_feed/S071321-v50.txt > /dev/null`. Claude cannot reboot or idle the
 machine, so a run made from a session is marked as not fully accurate in benchmarks.md.
-The latest entry is 2cd81d8, the baseline for plan Phase 1; it was run from a Claude session,
-not under standard conditions, and should be re-run. Record an entry for every hot-path
+The latest entries (2cd81d8, the Phase 1 baseline, and 031fa98) were run from a Claude
+session, not under standard conditions, and should be re-run. Record an entry for every hot-path
 change so regressions are attributable.
 
 ## Architecture (current)
 
-- `manager`: creates the shm segment, placement-news `ipc::PipelineShm`, release-stores the
-  magic, forks/execs workers with the shm fd as argv[1], `PR_SET_PDEATHSIG`. Any worker exit is
-  fatal and broadcasts SIGTERM to the process group.
+- `manager <cfg>`: creates the shm segment, placement-news `ipc::PipelineShm`, release-stores
+  the magic, forks/execs workers (shm fd as argv[1], `--config=`), `PR_SET_PDEATHSIG`, then
+  supervises: exchange/core exit 0 (feed done, `max_events`) shuts everything down
+  gracefully; their death sets KILL|PAUSE then shuts down; exec exit 75 or SIGUSR1 restarts
+  exec alone; exec death sets KILL and respawns only with `auto_restart_exec=1`; dashboard
+  exit is ignored. Shutdown SIGTERMs the process group.
 - `exchange_main` (core 2): `ItchParser` writes `common::Event` (128 B) into `exchange_to_core`.
 - `core_main` (hot thread core 4, snapshotter core 6, latency dump core 0): L3 `OrderBook` per
   `stock_locate` (robin-hood `OrderMap`, `PriceLevelArray` + radix-64 `OccupancyBitmap`,
@@ -54,15 +63,27 @@ change so regressions are attributable.
   `feed_to_exec`; a full ring drops the frame, counts it in `FeedStats` and flags the next one
   `FEED_RESET`. Then 15-level snapshots go to the dashboard via seqlock → snapshotter → ring.
   It registers its symbol in the shm `InstrumentTable` at startup.
-- `exec_main_<name>` (core 3): one binary per strategy in CMake's `EXEC_STRATEGIES`
-  (`name:Type:header`), so `on_tick` inlines into `run_strategy<S>`. `MarketView` plus a
-  local order-id tracker in `StrategyContext` (nothing fills until the Phase 2 router);
-  strategies satisfy the `exec::Strategy` concept. `MarketView` counts `event_seq` gaps and
-  exposes `feed_reset()`; exec publishes `frames`/`frame_gaps` to `exec_stats`.
-- shm v3 (`ipc::VERSION` 3) also carries `Control`, the order/report rings and the stats
-  seqlocks, still without producers. Workers attach through `ipc::attach_pipeline`, which
+- exec (core 3) is a trading engine: `ExecContext` (`src/exec/exec_context.hpp`) owns the
+  `MarketView`, `Account` (avg-cost positions, spot balances with reservations, 1e-8 money
+  units), `OrderTable` (dense rows + open-addressed index), `RiskGate` and `RateModel` (Kraken
+  per-pair counter). Strategies write `template <class Ctx> void on_tick(Ctx &) noexcept`
+  against `StrategyContext<Router>` (submit/replace/cancel/cancel_all, position, rate_budget;
+  every request is risk-checked first) with optional on_start/on_stop/on_exec/on_timer hooks.
+  `run_strategy<S, Router>` polls reports, handles one frame, and every timer period
+  (`exec.timer_ms`) publishes ExecStats/PositionStats/BalanceStats/OpenOrders. ITCH mode uses
+  `NullRouter` (acks, never fills) and the event-time clock (`exec.clock=event`).
+- Strategy modules (`src/exec/module_abi.hpp`, `loader.cpp`): each `EXEC_STRATEGIES` entry
+  (`name:Type:header`) builds `exec_main_<name>` (strategy built in) and `strategy_<name>.so`;
+  both expose the same `ll_strategy_module_v1` table and compile the whole hot loop, so code
+  is identical. The loader copies a .so into a memfd, rejects PT_TLS, checks ABI/layout
+  hash/ISA, and pre-faults it; `scripts/check_strategy_so.sh` gates every module at build.
+- shm v4 (`ipc::VERSION` 4) also carries `Control`, the order/report rings (no producer until
+  the gateway) and the stats seqlocks. Workers attach through `ipc::attach_pipeline`, which
   checks magic, version and `LAYOUT_HASH` (`src/common/ipc/layout.hpp`).
-- `dashboard`: ImGui/ImPlot reader of the snapshot ring.
+- `dashboard`: ImGui/ImPlot; a status strip (exec/feed heartbeats, KILL/PAUSE buttons, swap
+  field) above Market (book and plots), Trading (positions, balances, open orders,
+  execution, rejects by reason) and Latency & Health tabs. Self-paced at ~60 fps without
+  vsync (a hidden Wayland window blocks swaps forever).
 
 The README's architecture diagram (matching engine, order loopback) is stale; the README is
 updated in plan Phase 6.
@@ -82,7 +103,7 @@ only two physical cores are isolated. OpenSSL headers are not installed yet
 - Hot path: busy-polled, pinned, allocation-free, `noexcept`, stamped with `read_tsc()`. Static
   dispatch via templates and concepts; no virtuals on the hot path.
 - Cross-process types are POD, trivially copyable, 64-byte aligned, with `static_assert`s on
-  layout. Bump `ipc::VERSION` (currently 2) on any shm layout change.
+  layout. Bump `ipc::VERSION` (currently 4) on any shm layout change.
 - SPSC rings (`common::SpscRing`) with uint32 head/tail; seqlocks for single-writer state.
 - Comments: lean, only where non-obvious. Match the surrounding style.
 - `*.txt` is gitignored (the ITCH feed is .txt); use `.cfg` for config files.
@@ -125,8 +146,10 @@ connection is unconfirmed.
 ## Known quirks in current code
 
 - `common::Event` is 128 B, not 64 B (`_pad[2]` is misleading).
-- `core_main` hardcodes `PRIMARY` (TQQQ) and keeps the 20M benchmark cap commented out.
-- Exec stats are published every 65,536 frames and on exit, so `heartbeat_tsc` goes stale
-  while the feed is idle (Phase 2 adds a timer).
+- core_main builds one book: only the first of `symbols` is traded.
+- The Kraken amend cost is read as +1 plus the age penalty (conservative); confirm against
+  Kraken's docs before Phase 5 (`src/exec/rate_model.hpp`, `tests/fixtures/kraken_rate_vectors.csv`).
+- Exec state lives in zero-filled static storage; exec_main pre-faults it before the loop
+  (first-touch faults put a 3-6 us cluster in tick-to-order before that).
 - Seqlock fence ordering is x86-only; histogram buckets are power-of-two.
 - `build/plan.md` is an old, unrelated latency plan; the live plan is `plan.md` at the root.

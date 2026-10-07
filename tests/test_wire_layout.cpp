@@ -9,9 +9,9 @@
 #include "common/ipc/layout.hpp"
 #include "common/ipc/shm.hpp"
 
-static constexpr uint32_t GOLDEN_VERSION = 3;
-static constexpr uint32_t GOLDEN_LAYOUT_HASH = 0x1f31eb1a;
-static constexpr std::size_t GOLDEN_SHM_BYTES = 6638208;
+static constexpr uint32_t GOLDEN_VERSION = 4;
+static constexpr uint32_t GOLDEN_LAYOUT_HASH = 0x60a31267;
+static constexpr std::size_t GOLDEN_SHM_BYTES = 6639040;
 
 static void test_goldens() {
   std::printf("version=%u layout_hash=0x%08x sizeof(PipelineShm)=%zu\n",

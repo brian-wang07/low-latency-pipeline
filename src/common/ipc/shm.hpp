@@ -45,7 +45,7 @@ namespace ipc {
 inline constexpr const char *SHM_NAME = "pipeline_shm";
 inline constexpr size_t SHM_SIZE = 16 * 1024 * 1024;
 inline constexpr uint64_t MAGIC = 0xDEADBEEF;
-inline constexpr uint32_t VERSION = 3;
+inline constexpr uint32_t VERSION = 4;
 static_assert((SHM_SIZE & (SHM_SIZE - 1)) == 0);
 
 // Workers check version and layout_hash (ipc::LAYOUT_HASH in layout.hpp) and
@@ -69,6 +69,7 @@ struct alignas(64) PipelineShm {
   common::Seqlock<stats::ExecStats> exec_stats;
   common::Seqlock<stats::GatewayStats> gateway_stats;
   common::Seqlock<stats::PositionStats> positions;
+  common::Seqlock<stats::BalanceStats> balances;
   common::Seqlock<stats::OpenOrders> open_orders;
 };
 

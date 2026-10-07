@@ -1,0 +1,26 @@
+# Kraken per-pair rate counter costs, shared by tests/test_rate_model.cpp and
+# research/rate_model.py. op,age_ms,cost. Amend is read as +1 plus the age term
+# (conservative); re-check against Kraken's docs before Phase 5.
+add,0,1
+add,600000,1
+amend,0,4
+amend,4999,4
+amend,5000,3
+amend,9999,3
+amend,10000,2
+amend,14999,2
+amend,15000,1
+amend,600000,1
+cancel,0,8
+cancel,4999,8
+cancel,5000,6
+cancel,9999,6
+cancel,10000,5
+cancel,14999,5
+cancel,15000,4
+cancel,44999,4
+cancel,45000,2
+cancel,89999,2
+cancel,90000,1
+cancel,299999,1
+cancel,300000,0

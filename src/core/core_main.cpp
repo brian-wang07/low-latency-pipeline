@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "common/config.hpp"
+#include "common/config_file.hpp"
 #include "common/histogram.hpp"
 #include "common/ipc/dashboard_snapshot.hpp"
 #include "common/ipc/shm.hpp"
@@ -34,7 +35,18 @@ static_assert(std::is_trivially_copyable_v<LatencyStats>);
 static volatile std::sig_atomic_t shutdown_flag{0};
 static void on_signal(int) { shutdown_flag = 1; }
 
-static constexpr char PRIMARY[8] = {'T', 'Q', 'Q', 'Q', ' ', ' ', ' ', ' '};
+// ITCH tickers are space-padded to 8 bytes. The first of `symbols` is the book
+// this core builds and publishes; default TQQQ.
+static char PRIMARY[8] = {'T', 'Q', 'Q', 'Q', ' ', ' ', ' ', ' '};
+
+static void set_primary(const char *symbols) noexcept {
+  std::memset(PRIMARY, ' ', sizeof(PRIMARY));
+  for (int i = 0; i < 8 && symbols[i] && symbols[i] != ','; ++i)
+    PRIMARY[i] = symbols[i];
+  if (std::strchr(symbols, ','))
+    std::fprintf(stderr, "core_main: only the first of symbols=%s is traded\n",
+                 symbols);
+}
 
 // Book-frame depth is tied to the dashboard wire contract so the publisher can
 // copy levels 1:1 into the shared-ring frame.
@@ -148,8 +160,14 @@ struct DashboardPublisher {
 };
 
 int main(int argc, char **argv) {
-  if (argc != 2)
-    std::abort();
+  static common::Config cfg;
+  if (argc < 2 || !cfg.load_from_args(argc, argv))
+    return 2;
+  set_primary(cfg.get_str("symbols", "TQQQ"));
+  // 0 replays the whole feed.
+  const int64_t max_events_cfg = cfg.get_i64("max_events", 0);
+  const uint64_t max_events =
+      max_events_cfg > 0 ? uint64_t(max_events_cfg) : UINT64_MAX;
 
   ShmSegment shm;
   ipc::PipelineShm *p = ipc::attach_pipeline(argv[1], shm, "core_main");
@@ -179,7 +197,7 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 
-  if (!pin_to_core(config::HOT_CORE))
+  if (!pin_to_core(int(cfg.get_i64("cores.core", config::HOT_CORE))))
     std::perror("pin_to_core hot");
 
   // calibrate
@@ -251,14 +269,15 @@ int main(int argc, char **argv) {
                                &lat_seq,   tsc_per_ns,
                                primary_instrument, itch_row.tick_exp};
   std::thread snap_thread([&] {
-    core::run_snapshotter<DEPTH>(book_seq, config::SNAPSHOT_CORE,
+    core::run_snapshotter<DEPTH>(book_seq,
+                                 int(cfg.get_i64("cores.snapshot", config::SNAPSHOT_CORE)),
                                  std::chrono::milliseconds(33), snap_shutdown,
                                  publisher);
   });
 
   std::atomic<bool> lat_shutdown{false};
   std::thread lat_thread([&] {
-    if (!pin_to_core(config::LAT_DUMP_CORE))
+    if (!pin_to_core(int(cfg.get_i64("cores.lat_dump", config::LAT_DUMP_CORE))))
       std::perror("pin_to_core lat dump");
     LatencyStats local{};
     while (!lat_shutdown.load(std::memory_order_acquire)) {
@@ -279,11 +298,8 @@ int main(int argc, char **argv) {
   common::Histogram hist_core;
   common::Histogram hist_e2e;
   constexpr uint64_t PUB_MASK = (1ull << 16) - 1; // publish every 65k events
-  // constexpr uint64_t MAX_EVENTS = 20'000'000;
   uint64_t n{0};
-  while (!shutdown_flag
-         //&& n < MAX_EVENTS) {
-  ) {
+  while (!shutdown_flag && n < max_events) {
     if (ring->try_pop(ev)) {
       uint64_t t1 = read_tsc();
       process(ev);

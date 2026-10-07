@@ -947,6 +947,26 @@ Manager and dashboard:
     panels, ring and gap health.
 Done when: the Phase 2 deliverable holds and the swap test passes.
 
+Phase 2 as implemented (differences from the text above):
+- Strategies write `template <class Ctx> void on_tick(Ctx &) noexcept`, so one strategy serves
+  every router instantiation; logging and dummy changed one line each.
+- ITCH/null mode runs the rate model and order ages on event time (`exec.clock=event`); live
+  uses the TSC. Runs are deterministic, so the .so and baked order counts match exactly.
+- shm is v4 (BalanceStats, ExecStats reject-by-reason and report counters).
+- Module ABI: `run_null(state, ExecContext*, NullRouter*)`; run_* call on_start/on_stop
+  themselves; `run_live` is nullptr until Phase 4. The loader keeps each module's memfd open
+  (dlopen dedups by path, and a reused fd number would alias the previous module).
+- The OrderTable is dense rows behind an open-addressed index, so cancel_all and snapshots
+  touch only live orders.
+- Control.SWAP makes exec exit 75 and the manager respawn it with Control.swap_path (the
+  dashboard's swap field); SIGUSR1 does the same from the config's `strategy`.
+- core_main reads `symbols` and `max_events`; `configs/bench.cfg` replaces the local source
+  edits for benchmarks.
+- loopback_test.sh checks tick-to-order p99 < 2 us only with >= 1000 orders; below that it
+  checks the median and reports the max (a p99 of 44 samples is the slowest sample).
+- The Kraken amend cost is read as +1 plus the age penalty (conservative); confirm before
+  Phase 5.
+
 ### Phase 3: transport (parallel with Phase 2; needs openssl-devel)
 
 3.1 CMake: LL_BUILD_LIVE (OpenSSL, simdjson via FetchContent) and LL_BUILD_DASHBOARD options;

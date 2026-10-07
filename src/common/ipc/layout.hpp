@@ -35,6 +35,7 @@ constexpr uint32_t compute_layout_hash() noexcept {
       offsetof(PipelineShm, exec_stats),
       offsetof(PipelineShm, gateway_stats),
       offsetof(PipelineShm, positions),
+      offsetof(PipelineShm, balances),
       offsetof(PipelineShm, open_orders),
 
       sizeof(common::Event), alignof(common::Event),
@@ -59,7 +60,8 @@ constexpr uint32_t compute_layout_hash() noexcept {
 
       sizeof(stats::ExecStats), sizeof(stats::FeedStats),
       sizeof(stats::GatewayStats), sizeof(stats::PositionStats),
-      sizeof(stats::OpenOrders),
+      sizeof(stats::OpenOrders), sizeof(stats::BalanceStats),
+      offsetof(stats::ExecStats, rejects), offsetof(stats::ExecStats, mode),
   };
   uint32_t h = 2166136261u;
   for (uint64_t p : parts)

@@ -10,6 +10,8 @@
 // and manager.
 namespace stats {
 
+enum ExecMode : uint8_t { EXEC_NULL = 0, EXEC_LIVE = 1 };
+
 struct ExecStats {
   common::Histogram feed_transit;  // pop - tsc_in
   common::Histogram tick;          // on_tick duration
@@ -17,8 +19,17 @@ struct ExecStats {
   common::Histogram exec_transit;
   uint64_t frames, frame_gaps, orders_new, orders_cancel, risk_rejects,
       ring_full_rejects, iterations, heartbeat_tsc, exec_generation;
+  // Requests sent beyond orders_new/orders_cancel, and the reports that came back.
+  uint64_t orders_replace, acks, venue_rejects, canceled, replaced, expired,
+      fills, unsolicited;
+  uint64_t rejects[32]; // exec::RejectReason, risk and local failures
+  double rate_budget[4]; // first four traded instruments
+  // Risk limits echoed for the dashboard's utilization bars; 0 = disabled.
+  int64_t limit_max_position, limit_max_position_notional;
+  uint32_t open_orders;
   uint32_t strategy_id;
   char strategy_name[32];
+  uint8_t mode; // ExecMode
 };
 
 enum FeedMode : uint8_t { FEED_NONE = 0, FEED_ITCH = 1, FEED_VENUE = 2 };
@@ -50,6 +61,17 @@ struct PositionStats {
   uint32_t count;
 };
 
+// Spot balances, 1e-8 units of each asset.
+struct AssetBalance {
+  char name[8];
+  int64_t total, reserved;
+};
+
+struct BalanceStats {
+  AssetBalance assets[16];
+  uint32_t count;
+};
+
 struct OpenOrder {
   uint64_t cl_ord_id, tsc_sent;
   int64_t px, qty, leaves;
@@ -67,6 +89,7 @@ static_assert(std::is_trivially_copyable_v<ExecStats>);
 static_assert(std::is_trivially_copyable_v<FeedStats>);
 static_assert(std::is_trivially_copyable_v<GatewayStats>);
 static_assert(std::is_trivially_copyable_v<PositionStats>);
+static_assert(std::is_trivially_copyable_v<BalanceStats>);
 static_assert(std::is_trivially_copyable_v<OpenOrders>);
 
 } // namespace stats

@@ -1,19 +1,23 @@
 // Dashboard process (forked by the manager). Attaches to the shared segment,
 // drains the core->dashboard SPSC ring of book snapshots, and renders the live
-// order book + metric plots with ImGui/ImPlot at vsync (~60fps). Read-only
-// consumer: it never touches the hot path. Closing the window (or a group
-// SIGTERM from the manager) ends the process.
+// order book + metric plots with ImGui/ImPlot at ~60fps, plus the trading status,
+// controls and health tabs over the exec/feed stats blocks. Never touches the hot
+// path; its only writes are the operator controls (KILL, PAUSE, swap). Closing the
+// window (or a group SIGTERM from the manager) ends the process.
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <utility>
 
 #include "common/ipc/dashboard_snapshot.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
+#include "dashboard/trading_panels.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -483,8 +487,8 @@ static void render_plots(const Frame &s, const PlotRing &ring) {
 // ---------------------------------------------------------------------------
 // GLFW + ImGui/ImPlot setup and render loop. Owns the window for the process.
 // ---------------------------------------------------------------------------
-static void run_ui(dashboard::DashboardRing &ring,
-                   volatile std::sig_atomic_t &running) {
+static void run_ui(ipc::PipelineShm *p, volatile std::sig_atomic_t &running) {
+  dashboard::DashboardRing &ring = p->core_to_dashboard;
   glfwSetErrorCallback([](int code, const char *desc) {
     std::fprintf(stderr, "GLFW error %d: %s\n", code, desc);
   });
@@ -511,7 +515,9 @@ static void run_ui(dashboard::DashboardRing &ring,
   }
 
   glfwMakeContextCurrent(window);
-  glfwSwapInterval(1); // vsync ~60 fps
+  // No vsync: a hidden window on Wayland blocks swaps indefinitely, which would
+  // stop this loop from ever seeing SIGTERM. Frames are paced below instead.
+  glfwSwapInterval(0);
 
 #ifdef __APPLE__
   const char *glsl_version = "#version 150";
@@ -532,13 +538,19 @@ static void run_ui(dashboard::DashboardRing &ring,
 #endif
   ImGui::GetStyle().Colors[ImGuiCol_Text] = ImVec4(0.95f, 0.95f, 0.95f, 1.0f);
 
+  dashboard::TradingPanels trading(p);
   Frame latest{};
   Frame book_local{};
   PlotRing ring_hist{};
   bool have_data = false;
   double last_book_update = 0.0;
 
+  auto next_frame = std::chrono::steady_clock::now();
   while (!glfwWindowShouldClose(window) && running) {
+    next_frame += std::chrono::microseconds(16'667); // ~60 fps
+    std::this_thread::sleep_until(next_frame);
+    if (std::chrono::steady_clock::now() > next_frame + std::chrono::milliseconds(100))
+      next_frame = std::chrono::steady_clock::now(); // don't race to catch up
     glfwPollEvents();
 
     // Drain the ring; keep the most recent frame.
@@ -549,6 +561,7 @@ static void run_ui(dashboard::DashboardRing &ring,
     }
 
     double t_now = glfwGetTime();
+    trading.update(t_now);
     if (have_data) {
       ring_hist.push((float)t_now, latest);
       if (t_now - last_book_update >= BOOK_UPDATE_INTERVAL) {
@@ -614,16 +627,35 @@ static void run_ui(dashboard::DashboardRing &ring,
       avail_h -= bar_h + ImGui::GetStyle().ItemSpacing.y;
     }
 
-    // Top panel — order book (slow-updated at BOOK_UPDATE_HZ)
-    ImGui::BeginChild("##depth", ImVec2(avail_w, depth_h), true);
-    render_book(book_local);
-    ImGui::EndChild();
+    // Status strip and operator controls, visible on every tab.
+    trading.render_status_strip();
+    ImGui::Separator();
 
-    // Bottom panel — metric plots (live)
-    ImGui::BeginChild("##plots", ImVec2(avail_w, avail_h - depth_h - 8.f),
-                      false);
-    render_plots(latest, ring_hist);
-    ImGui::EndChild();
+    if (ImGui::BeginTabBar("##tabs")) {
+      if (ImGui::BeginTabItem("Market")) {
+        avail_h = ImGui::GetContentRegionAvail().y;
+        // Top panel — order book (slow-updated at BOOK_UPDATE_HZ)
+        ImGui::BeginChild("##depth", ImVec2(avail_w, depth_h), true);
+        render_book(book_local);
+        ImGui::EndChild();
+
+        // Bottom panel — metric plots (live)
+        ImGui::BeginChild("##plots", ImVec2(avail_w, avail_h - depth_h - 8.f),
+                          false);
+        render_plots(latest, ring_hist);
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Trading")) {
+        trading.render_trading_tab();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Latency & Health")) {
+        trading.render_health_tab();
+        ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
+    }
 
     ImGui::End();
 
@@ -647,8 +679,8 @@ static void run_ui(dashboard::DashboardRing &ring,
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2)
-    std::abort();
+  if (argc < 2)
+    return 2;
 
   ShmSegment shm;
   ipc::PipelineShm *p = ipc::attach_pipeline(argv[1], shm, "dashboard");
@@ -662,6 +694,6 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 
-  run_ui(p->core_to_dashboard, g_running);
+  run_ui(p, g_running);
   return 0;
 }

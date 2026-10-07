@@ -10,7 +10,7 @@ namespace exec {
 // prove data flows end to end. Does not quote. Replace with a real Strategy.
 class LoggingStrategy {
 public:
-  void on_tick(StrategyContext &ctx) noexcept {
+  template <class Ctx> void on_tick(Ctx &ctx) noexcept {
     const MarketView &m = ctx.market();
     ++ticks_;
     if (m.last_was_trade())

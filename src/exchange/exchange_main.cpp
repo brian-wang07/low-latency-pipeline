@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "common/config.hpp"
+#include "common/config_file.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
 #include "common/platform/cpu_pin.hpp"
@@ -16,8 +17,9 @@ static volatile std::sig_atomic_t shutdown_flag{0};
 static void on_signal(int) { shutdown_flag = 1; }
 
 int main(int argc, char **argv) {
-  if (argc != 3)
-    std::abort();
+  static common::Config cfg;
+  if (argc < 3 || !cfg.load_from_args(argc, argv))
+    return 2;
 
   int data_fd = open(argv[2], O_RDONLY);
   if (data_fd < 0) {
@@ -35,7 +37,7 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 
-  if (!pin_to_core(config::EXCHANGE_CORE))
+  if (!pin_to_core(int(cfg.get_i64("cores.exchange", config::EXCHANGE_CORE))))
     std::perror("pin_to_core exchange");
 
   ItchParser parser{data_fd, &p->exchange_to_core, &shutdown_flag};

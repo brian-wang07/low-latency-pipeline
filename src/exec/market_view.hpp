@@ -47,6 +47,11 @@ public:
   int64_t bid_size() const noexcept { return u_.nb > 0 ? u_.bids[0].qty : 0; }
   int64_t ask_size() const noexcept { return u_.na > 0 ? u_.asks[0].qty : 0; }
 
+  // bid + ask in ticks (twice the mid, exact); 0 unless two_sided().
+  int64_t mid2() const noexcept {
+    return two_sided() ? u_.best_bid + u_.best_ask : 0;
+  }
+
   // Derived values below are valid only when two_sided().
   double mid() const noexcept {
     return 0.5 * (double(u_.best_bid) + double(u_.best_ask));

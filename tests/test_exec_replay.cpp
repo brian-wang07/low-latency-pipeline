@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <csignal>
 #include <thread>
 
 #include "check.hpp"
@@ -16,13 +17,16 @@
 #include "exchange/itch/itch_parser.hpp"
 #include "exec/market_view.hpp"
 #include "exec/strategies/dummy_quoter.hpp"
+#include "exec/runner.hpp"
 #include "exec/strategy.hpp"
 
 static constexpr char SYMBOL[8] = {'N', 'V', 'D', 'A', ' ', ' ', ' ', ' '};
 // Re-pin only for an intended behavior change, and say why here.
 // 0x605af753ab83cdd8: EXEC_DEPTH 5 -> 10 (the int64 widening alone kept 0x4007cf1c29a08c26).
 // 0x2ccba671122fdfc0: frame flags hashed, ITCH 'Q' crosses carried as trades (+2).
-static constexpr uint64_t EXPECTED_DIGEST = 0x2ccba671122fdfc0;
+// 0xfc5c6bbcb7c57af5: Phase 2 engine (NullRouter, risk gate, Kraken rate model on
+//   event time); DummyQuoter amends to follow the touch. Engine counters hashed.
+static constexpr uint64_t EXPECTED_DIGEST = 0xfc5c6bbcb7c57af5;
 
 struct Fnv1a {
   uint64_t h = 14695981039346656037ull;
@@ -59,9 +63,31 @@ int main(int argc, char *argv[]) {
   static core::equity::BookArray engine;
   core::PrimaryFeed feed{engine, SYMBOL};
   static core::BookSnapshot<dashboard::DASH_DEPTH> snap{};
-  exec::MarketView view;
-  exec::StrategyContext ctx(view);
-  exec::DummyQuoter quoter;
+
+  // The exec engine exactly as exec_main runs it, minus the shm feed ring.
+  auto shm = std::make_unique<ipc::PipelineShm>();
+  ref::Instrument row{};
+  std::strcpy(row.symbol, "NVDA");
+  std::strcpy(row.venue, "ITCH");
+  row.tick_mant = 1;
+  row.tick_exp = -4;
+  row.lot_mant = 1;
+  row.min_qty_lots = 1;
+  shm->instruments.add(row);
+  static common::Config cfg;
+  cfg.parse("risk.allowed_assets=NVDA\n"
+            "risk.max_position=1000\n"
+            "risk.price_band_bp=500\n"
+            "null.balance.USD=10000000\n"
+            "null.balance.NVDA=100000\n"
+            "rate.model=kraken\n");
+  static volatile std::sig_atomic_t never = 0;
+  static exec::ExecContext x;
+  CHECK(x.setup(shm.get(), cfg, &never));
+  static exec::NullRouter router;
+  static exec::DummyQuoter quoter;
+  exec::StrategyContext<exec::NullRouter> ctx(x, router);
+  const exec::MarketView &view = x.view;
 
   Fnv1a digest;
   exec::MarketUpdate<exec::EXEC_DEPTH> mu{};
@@ -80,8 +106,8 @@ int main(int argc, char *argv[]) {
       continue;
     core::capture(snap, *book, SYMBOL, feed.count);
     core::build_market_update(mu, ev, snap, trade, 0, 0);
-    view.on_update(mu);
-    quoter.on_tick(ctx);
+    exec::poll_reports(quoter, x, router, ctx);
+    exec::handle_frame(quoter, x, router, ctx, mu);
 
     ++frames;
     if (mu.trade_qty != 0)
@@ -117,18 +143,37 @@ int main(int argc, char *argv[]) {
       digest.add_f64(view.imbalance());
     }
     digest.add_f64(view.realized_vol());
-    digest.add(ctx.orders_submitted());
+    // What the strategy did through the engine.
+    digest.add(x.st.orders_new);
+    digest.add(x.st.orders_replace);
+    digest.add(x.st.orders_cancel);
+    digest.add(x.st.acks);
+    digest.add(x.st.risk_rejects);
+    digest.add(x.orders.size());
   }
+  exec::poll_reports(quoter, x, router, ctx);
   producer.join();
 
   std::printf("events=%" PRIu64 " frames=%" PRIu64 " trades=%" PRIu64
-              " crosses=%" PRIu64 " orders=%" PRIu64 " gaps=%" PRIu64
-              " digest=0x%016" PRIx64 "\n",
-              events, frames, trades, crosses, ctx.orders_submitted(),
-              view.frame_gaps(), digest.h);
+              " crosses=%" PRIu64 " gaps=%" PRIu64 "\n",
+              events, frames, trades, crosses, view.frame_gaps());
+  std::printf("orders_new=%" PRIu64 " replaces=%" PRIu64 " cancels=%" PRIu64
+              " acks=%" PRIu64 " replaced=%" PRIu64 " risk_rejects=%" PRIu64
+              " (rate_limit=%" PRIu64 ") open=%u\n",
+              x.st.orders_new, x.st.orders_replace, x.st.orders_cancel, x.st.acks,
+              x.st.replaced, x.st.risk_rejects,
+              x.st.rejects[size_t(exec::RejectReason::RateLimit)], x.orders.size());
+  for (int r = 1; r < int(exec::RejectReason::Count); ++r)
+    if (x.st.rejects[r])
+      std::printf("  reject.%s=%" PRIu64 "\n", exec::reject_name(exec::RejectReason(r)),
+                  x.st.rejects[r]);
+  std::printf("digest=0x%016" PRIx64 "\n", digest.h);
   CHECK(events > 0);
   CHECK(frames > 0);
   CHECK(view.frame_gaps() == 0);
+  CHECK(x.st.acks == x.st.orders_new);       // NullRouter acks every order sent
+  CHECK(x.st.replaced == x.st.orders_replace);
+  CHECK(x.st.fills == 0);
   CHECK(digest.h == EXPECTED_DIGEST);
   return check_summary();
 }
