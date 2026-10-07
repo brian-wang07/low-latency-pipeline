@@ -115,6 +115,15 @@ public:
     uint32_t order_count;
   };
 
+  // Resolved trade produced by an execute. shares == 0 means no trade (e.g. the
+  // execute referenced an unknown order). side is the resting order's side, so a
+  // Buy-side trade is an aggressor selling into the bids.
+  struct Trade {
+    Price price{0};
+    Qty shares{0};
+    common::Side side{common::Side::Buy};
+  };
+
   OrderBook() = default;
   OrderBook(const OrderBook &) = delete;
   OrderBook &operator=(const OrderBook &) = delete;
@@ -125,10 +134,10 @@ public:
   void on_add(OrderRef ref, common::Side side, Price price,
               Qty shares) noexcept;
   // itch E
-  void on_execute(OrderRef ref, Qty executed_shares) noexcept;
+  Trade on_execute(OrderRef ref, Qty executed_shares) noexcept;
   // itch C
-  void on_execute_with_price(OrderRef ref, Qty executed_shares,
-                             Price execution_price) noexcept;
+  Trade on_execute_with_price(OrderRef ref, Qty executed_shares,
+                              Price execution_price) noexcept;
   // itch X
   void on_cancel(OrderRef ref, Qty cancelled_shares) noexcept;
   // itch D

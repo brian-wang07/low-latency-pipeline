@@ -20,12 +20,6 @@ struct WorkerSpec {
   const char *extra_arg; // nullptr if the worker takes only the shm fd
 };
 
-static constexpr WorkerSpec WORKERS[] = {
-    {"./exchange_main", "../itch_feed/S071321-v50.txt"},
-    {"./core_main", nullptr},
-    {"./dashboard", nullptr},
-};
-
 static pid_t spawn(const WorkerSpec &w, int shm_fd, pid_t parent_pid) {
   pid_t pid = fork();
   if (pid < 0) {
@@ -74,9 +68,23 @@ int main() {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 
+  // exec runs one binary per strategy; pick which at launch via EXEC_STRATEGY.
+  const char *strat = std::getenv("EXEC_STRATEGY");
+  if (!strat)
+    strat = "logging";
+  char exec_path[64];
+  std::snprintf(exec_path, sizeof(exec_path), "./exec_main_%s", strat);
+
+  const WorkerSpec workers[] = {
+      {"./exchange_main", "../itch_feed/S071321-v50.txt"},
+      {"./core_main", nullptr},
+      {exec_path, nullptr},
+      {"./dashboard", nullptr},
+  };
+
   pid_t parent_pid = getpid();
   std::size_t alive = 0;
-  for (const auto &w : WORKERS) {
+  for (const auto &w : workers) {
     if (spawn(w, shm.fd(), parent_pid) > 0)
       ++alive;
   }

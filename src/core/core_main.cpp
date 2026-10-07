@@ -1,6 +1,7 @@
 // Hot thread: drives the orderbook off the exchange ring and publishes a
 // fixed-size frame to the seqlock after each event. All rendering /
 // downstream work happens on the snapshotter thread, never here.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -143,6 +144,36 @@ struct DashboardPublisher {
   }
 };
 
+// Build the resolved exec feed frame from the freshly-captured book snapshot plus the
+// triggering event and any trade it produced. The exec feed's depth is a prefix of
+// the in-process snapshot, so we reuse its already-walked levels instead of walking
+// the book a second time on the hot path.
+static exec::MarketUpdate<exec::EXEC_DEPTH>
+make_market_update(const common::Event &ev, const core::BookSnapshot<DEPTH> &snap,
+                   const core::equity::OrderBook::Trade &trade) noexcept {
+  static_assert(exec::EXEC_DEPTH <= DEPTH,
+                "exec feed depth must fit within the in-process snapshot");
+  exec::MarketUpdate<exec::EXEC_DEPTH> mu{};
+  mu.event_seq = snap.event_seq;
+  mu.event_time = ev.timestamp;
+  mu.tsc_in = ev.tsc_in;
+  std::memcpy(mu.stock_id, snap.stock_id, sizeof(mu.stock_id));
+  mu.best_bid = snap.best_bid;
+  mu.best_ask = snap.best_ask;
+  mu.trade_price = trade.price;
+  mu.trade_size = trade.shares;
+  mu.trade_side = trade.side;
+  mu.nb = std::min(snap.nb, static_cast<int>(exec::EXEC_DEPTH));
+  mu.na = std::min(snap.na, static_cast<int>(exec::EXEC_DEPTH));
+  for (int i = 0; i < mu.nb; ++i)
+    mu.bids[i] = {snap.bids[i].price, snap.bids[i].shares,
+                  snap.bids[i].order_count};
+  for (int i = 0; i < mu.na; ++i)
+    mu.asks[i] = {snap.asks[i].price, snap.asks[i].shares,
+                  snap.asks[i].order_count};
+  return mu;
+}
+
 int main(int argc, char **argv) {
   if (argc != 2)
     std::abort();
@@ -160,6 +191,7 @@ int main(int argc, char **argv) {
     std::abort();
 
   core::CoreRing *ring = &p->exchange_to_core;
+  exec::ExecRing *exec_ring = &p->core_to_exec;
   dashboard::DashboardRing *dash_ring = &p->core_to_dashboard;
 
   struct sigaction sa{};
@@ -228,16 +260,18 @@ int main(int argc, char **argv) {
 
     ++primary_count;
 
+    core::equity::OrderBook::Trade trade{};
     switch (ev.message_type) {
     case 'A':
     case 'F':
       book->on_add(ev.order_ref_number, ev.side, ev.price, ev.shares);
       break;
     case 'E':
-      book->on_execute(ev.order_ref_number, ev.shares);
+      trade = book->on_execute(ev.order_ref_number, ev.shares);
       break;
     case 'C':
-      book->on_execute_with_price(ev.order_ref_number, ev.shares, ev.price);
+      trade = book->on_execute_with_price(ev.order_ref_number, ev.shares,
+                                          ev.price);
       break;
     case 'X':
       book->on_cancel(ev.order_ref_number, ev.shares);
@@ -249,11 +283,18 @@ int main(int argc, char **argv) {
       book->on_replace(ev.order_ref_number, ev.new_order_ref_number, ev.price,
                        ev.shares);
       break;
+    case 'P':
+      // Non-displayed (hidden) trade: real flow, but it never touches the visible
+      // book. Side/price/size come straight off the wire.
+      trade = {ev.price, ev.shares, ev.side};
+      break;
     }
 
-    // attempt to publish frame
+    // Publish the book snapshot to the in-process seqlock (dashboard path) and the
+    // resolved frame to the exec feed.
     core::capture(scratch, *book, PRIMARY, primary_count);
     book_seq.store(scratch);
+    (void)exec_ring->try_push(make_market_update(ev, scratch, trade));
   };
 
   // Hot thread publishes cumulative histograms here; both the snapshotter (for
@@ -295,7 +336,7 @@ int main(int argc, char **argv) {
   // constexpr uint64_t MAX_EVENTS = 20'000'000;
   uint64_t n{0};
   while (!shutdown_flag
-         // && n < MAX_EVENTS
+         //&& n < MAX_EVENTS) {
   ) {
     if (ring->try_pop(ev)) {
       uint64_t t1 = read_tsc();

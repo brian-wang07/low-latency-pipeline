@@ -2,6 +2,7 @@
 
 #include "common/event.hpp"
 #include "common/ipc/dashboard_snapshot.hpp"
+#include "common/ipc/market_update.hpp"
 #include "common/spsc_ring.hpp"
 #include <atomic>
 #include <cstdint>
@@ -31,6 +32,14 @@ inline constexpr std::uint32_t CORE_RING_CAPACITY = 8192;
 using CoreRing = common::SpscRing<common::Event, CORE_RING_CAPACITY>;
 } // namespace core
 
+namespace exec {
+
+// producer: core (feed handler), consumer: exec process
+inline constexpr std::size_t EXEC_DEPTH = 5;
+inline constexpr std::uint32_t EXEC_RING_CAPACITY = 8192;
+using ExecRing = common::SpscRing<MarketUpdate<EXEC_DEPTH>, EXEC_RING_CAPACITY>;
+} // namespace exec
+
 namespace dashboard {
 
 // book snapshot frames for the GUI
@@ -47,7 +56,7 @@ namespace ipc {
 inline constexpr const char *SHM_NAME = "pipeline_shm";
 inline constexpr size_t SHM_SIZE = 16 * 1024 * 1024;
 inline constexpr uint64_t MAGIC = 0xDEADBEEF;
-inline constexpr uint32_t VERSION = 1;
+inline constexpr uint32_t VERSION = 2;
 static_assert((SHM_SIZE & (SHM_SIZE - 1)) == 0);
 
 struct alignas(64) ShmHeader {
@@ -59,6 +68,7 @@ struct alignas(64) ShmHeader {
 struct alignas(64) PipelineShm {
   ShmHeader header;
   core::CoreRing exchange_to_core;
+  exec::ExecRing core_to_exec;
   dashboard::DashboardRing core_to_dashboard;
 };
 

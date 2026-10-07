@@ -179,10 +179,11 @@ void OrderBook::on_add(OrderRef ref, common::Side side, Price price,
   }
 }
 
-void OrderBook::on_execute(OrderRef ref, Qty executed_shares) noexcept {
+OrderBook::Trade OrderBook::on_execute(OrderRef ref,
+                                       Qty executed_shares) noexcept {
   OrderEntry *entry = orders_.find(ref);
   if (!entry)
-    return;
+    return {};
   Price price = entry->price;
   common::Side side = entry->side;
   if (side == common::Side::Buy) {
@@ -206,11 +207,18 @@ void OrderBook::on_execute(OrderRef ref, Qty executed_shares) noexcept {
         on_level_emptied(common::Side::Sell, price);
     }
   }
+  return {price, executed_shares, side};
 }
 
-void OrderBook::on_execute_with_price(OrderRef ref, Qty executed_shares,
-                                      Price /*execution_price*/) noexcept {
-  on_execute(ref, executed_shares);
+OrderBook::Trade OrderBook::on_execute_with_price(OrderRef ref,
+                                                  Qty executed_shares,
+                                                  Price execution_price) noexcept {
+  Trade t = on_execute(ref, executed_shares);
+  // 'C' prints at the actual execution price, which can differ from the resting
+  // order's display price; the book accounting above used the display price.
+  if (t.shares != 0)
+    t.price = execution_price;
+  return t;
 }
 
 void OrderBook::on_cancel(OrderRef ref, Qty cancelled_shares) noexcept {

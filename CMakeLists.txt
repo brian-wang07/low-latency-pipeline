@@ -146,6 +146,30 @@ add_executable(core_main
 target_include_directories(core_main PRIVATE src)
 target_link_libraries(core_main PRIVATE Threads::Threads)
 
+# One exec binary per strategy, each with its strategy statically inlined (zero
+# hot-path overhead). Select which to launch at runtime via EXEC_STRATEGY (see the
+# manager). Format per entry: <name>:<type>:<header>.
+set(EXEC_STRATEGIES
+    "logging:LoggingStrategy:exec/strategies/logging_strategy.hpp"
+    "dummy:DummyQuoter:exec/strategies/dummy_quoter.hpp"
+)
+foreach(spec ${EXEC_STRATEGIES})
+    string(REPLACE ":" ";" parts "${spec}")
+    list(GET parts 0 strat_name)
+    list(GET parts 1 strat_type)
+    list(GET parts 2 strat_header)
+    add_executable(exec_main_${strat_name}
+        src/exec/exec_main.cpp
+        src/common/ipc/shm_segment.cpp
+    )
+    target_include_directories(exec_main_${strat_name} PRIVATE src)
+    target_link_libraries(exec_main_${strat_name} PRIVATE Threads::Threads)
+    target_compile_definitions(exec_main_${strat_name} PRIVATE
+        EXEC_STRATEGY_TYPE=${strat_type}
+        EXEC_STRATEGY_HEADER="${strat_header}"
+    )
+endforeach()
+
 add_executable(dashboard
     src/dashboard/dashboard_main.cpp
     src/common/ipc/shm_segment.cpp
