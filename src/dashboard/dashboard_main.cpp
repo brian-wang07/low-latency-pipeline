@@ -9,13 +9,11 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <string>
 #include <utility>
 
 #include "common/ipc/dashboard_snapshot.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
-#include "common/platform/spin_pause.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -73,8 +71,9 @@ struct PlotRing {
 
   void push(float t_now, const Frame &s) {
     t[ins] = t_now;
-    bid[ins] = (float)to_display(s.best_bid);
-    ask[ins] = (float)to_display(s.best_ask);
+    // NaN leaves a gap in the plot while a side is empty.
+    bid[ins] = s.best_bid ? (float)to_display(s.best_bid, s.price_exp) : NAN;
+    ask[ins] = s.best_ask ? (float)to_display(s.best_ask, s.price_exp) : NAN;
     vwmid[ins] = (float)s.vwmid;
     micro_trend[ins] = (float)(s.ema - s.vwmid);
     imbalance[ins] = (float)s.imbalance;
@@ -126,8 +125,8 @@ static std::pair<float, float> ring_range(const float *ys, int sz, int oldest,
 static void plot_price_trio(const Frame &s, const PlotRing &ring, int sz,
                             int oldest, float t_now, ImVec2 psz) {
   char bbuf[64], abuf[64], vbuf[64];
-  std::snprintf(bbuf, sizeof(bbuf), "Bid: %.4f", to_display(s.best_bid));
-  std::snprintf(abuf, sizeof(abuf), "  Ask: %.4f", to_display(s.best_ask));
+  std::snprintf(bbuf, sizeof(bbuf), "Bid: %.4f", to_display(s.best_bid, s.price_exp));
+  std::snprintf(abuf, sizeof(abuf), "  Ask: %.4f", to_display(s.best_ask, s.price_exp));
   std::snprintf(vbuf, sizeof(vbuf), "  VWMID: %.4f", s.vwmid);
 
   ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.9f, 0.2f, 1.f));
@@ -375,7 +374,7 @@ static void render_book(const Frame &s) {
   // Centered, large spread
   {
     char spread_buf[64];
-    std::snprintf(spread_buf, sizeof(spread_buf), "%.6f", to_display(s.spread));
+    std::snprintf(spread_buf, sizeof(spread_buf), "%.6f", to_display(s.spread, s.price_exp));
 
     if (g_font_large)
       ImGui::PushFont(g_font_large);
@@ -390,7 +389,7 @@ static void render_book(const Frame &s) {
   }
 
   // Stats row
-  ImGui::Text("Seq: %" PRIu64 "  BidQty: %" PRIu64 "  AskQty: %" PRIu64,
+  ImGui::Text("Seq: %" PRIu64 "  BidQty: %" PRId64 "  AskQty: %" PRId64,
               s.event_seq, s.total_bid_qty, s.total_ask_qty);
   ImGui::Separator();
 
@@ -414,10 +413,10 @@ static void render_book(const Frame &s) {
       ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.9f, 0.2f, 1.f));
       ImGui::TableSetColumnIndex(0);
       if (i < s.nb)
-        ImGui::Text("%.6f", to_display(s.bids[i].price));
+        ImGui::Text("%.6f", to_display(s.bids[i].price, s.price_exp));
       ImGui::TableSetColumnIndex(1);
       if (i < s.nb)
-        ImGui::Text("%u", s.bids[i].shares);
+        ImGui::Text("%" PRId64, s.bids[i].qty);
       ImGui::TableSetColumnIndex(2);
       if (i < s.nb)
         ImGui::Text("%u", s.bids[i].order_count);
@@ -429,10 +428,10 @@ static void render_book(const Frame &s) {
         ImGui::Text("%u", s.asks[i].order_count);
       ImGui::TableSetColumnIndex(4);
       if (i < s.na)
-        ImGui::Text("%u", s.asks[i].shares);
+        ImGui::Text("%" PRId64, s.asks[i].qty);
       ImGui::TableSetColumnIndex(5);
       if (i < s.na)
-        ImGui::Text("%.6f", to_display(s.asks[i].price));
+        ImGui::Text("%.6f", to_display(s.asks[i].price, s.price_exp));
       ImGui::PopStyleColor();
     }
     ImGui::EndTable();
@@ -651,16 +650,8 @@ int main(int argc, char **argv) {
   if (argc != 2)
     std::abort();
 
-  int shm_fd = std::stoi(argv[1]);
-
   ShmSegment shm;
-  if (!shm.attach(shm_fd, ipc::SHM_SIZE))
-    std::abort();
-  auto *p = shm.as<ipc::PipelineShm>();
-  while (p->header.magic.load(std::memory_order_acquire) == 0)
-    SPIN_PAUSE();
-  if (p->header.magic != ipc::MAGIC)
-    std::abort();
+  ipc::PipelineShm *p = ipc::attach_pipeline(argv[1], shm, "dashboard");
 
   // Manager delivers SIGTERM to the group on shutdown; exit the loop cleanly so
   // GLFW/ImGui release the GL context.

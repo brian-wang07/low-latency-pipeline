@@ -4,14 +4,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
-#include <string>
 #include <thread>
 
 #include "common/config.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
 #include "common/platform/cpu_pin.hpp"
-#include "common/platform/spin_pause.hpp"
 #include "exchange/itch/itch_parser.hpp"
 
 static volatile std::sig_atomic_t shutdown_flag{0};
@@ -21,7 +19,6 @@ int main(int argc, char **argv) {
   if (argc != 3)
     std::abort();
 
-  int shm_fd = std::stoi(argv[1]);
   int data_fd = open(argv[2], O_RDONLY);
   if (data_fd < 0) {
     std::perror("open");
@@ -29,14 +26,7 @@ int main(int argc, char **argv) {
   }
 
   ShmSegment shm;
-  if (!shm.attach(shm_fd, ipc::SHM_SIZE))
-    std::abort();
-  auto *p = shm.as<ipc::PipelineShm>();
-  while (p->header.magic.load(std::memory_order_acquire) == 0) {
-    SPIN_PAUSE();
-  }
-  if (p->header.magic != ipc::MAGIC)
-    std::abort();
+  ipc::PipelineShm *p = ipc::attach_pipeline(argv[1], shm, "exchange_main");
 
   struct sigaction sa{};
   sa.sa_handler = on_signal;

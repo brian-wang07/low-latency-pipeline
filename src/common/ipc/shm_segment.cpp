@@ -1,34 +1,48 @@
 #include "shm_segment.hpp"
 
+#include "common/ipc/layout.hpp"
+#include "common/platform/spin_pause.hpp"
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <sys/mman.h>
 #include <unistd.h>
+
+// Maps a fresh memfd of `size`; returns false (fd closed) on any failure.
+static bool map_memfd(const char *label, std::size_t size, unsigned flags,
+                      int &fd, void *&addr) {
+  fd = ::memfd_create(label, flags);
+  if (fd == -1)
+    return false;
+  if (::ftruncate(fd, static_cast<off_t>(size)) == -1) {
+    ::close(fd);
+    fd = -1;
+    return false;
+  }
+  addr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_POPULATE, fd, 0);
+  if (addr == MAP_FAILED) {
+    ::close(fd);
+    fd = -1;
+    addr = nullptr;
+    return false;
+  }
+  return true;
+}
 
 bool ShmSegment::create(const char *label, std::size_t size) {
   if (is_valid_)
     return false;
 
-  fd_ = ::memfd_create(label, MFD_HUGETLB);
-  if (fd_ == -1) {
-    std::perror("memfd_create failed");
-    return false;
-  }
-
-  if (::ftruncate(fd_, static_cast<off_t>(size)) == -1) {
-    std::perror("ftruncate failed");
-    ::close(fd_);
-    fd_ = -1;
-    return false;
-  }
-
-  addr_ = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                 MAP_SHARED | MAP_POPULATE, fd_, 0);
-  if (addr_ == MAP_FAILED) {
-    std::perror("mmap failed");
-    ::close(fd_);
-    fd_ = -1;
-    addr_ = nullptr;
-    return false;
+  // An empty hugepage pool surfaces as mmap ENOMEM under MAP_POPULATE, not as a
+  // memfd_create error, so fall back on either.
+  if (!map_memfd(label, size, MFD_HUGETLB, fd_, addr_)) {
+    std::perror("hugetlb shm unavailable");
+    std::fprintf(stderr, "warning: falling back to normal pages for shm\n");
+    if (!map_memfd(label, size, 0, fd_, addr_)) {
+      std::perror("shm create failed");
+      return false;
+    }
   }
 
   size_ = size;
@@ -95,4 +109,35 @@ ShmSegment &ShmSegment::operator=(ShmSegment &&other) noexcept {
     other.is_valid_ = false;
   }
   return *this;
+}
+
+ipc::PipelineShm *ipc::attach_pipeline(const char *fd_arg, ShmSegment &shm,
+                                       const char *who) noexcept {
+  char *end = nullptr;
+  const long fd = fd_arg ? std::strtol(fd_arg, &end, 10) : -1;
+  if (!fd_arg || end == fd_arg || *end != '\0' || fd < 0 || fd > INT_MAX) {
+    std::fprintf(stderr, "%s: bad shm fd argument '%s'\n", who,
+                 fd_arg ? fd_arg : "(null)");
+    std::exit(2);
+  }
+  if (!shm.attach(static_cast<int>(fd), SHM_SIZE)) {
+    std::fprintf(stderr, "%s: cannot map shm fd %ld\n", who, fd);
+    std::exit(2);
+  }
+  auto *p = shm.as<PipelineShm>();
+  while (p->header.magic.load(std::memory_order_acquire) == 0)
+    SPIN_PAUSE();
+  if (p->header.magic.load(std::memory_order_relaxed) != MAGIC ||
+      p->header.version != VERSION || p->header.layout_hash != LAYOUT_HASH) {
+    std::fprintf(stderr,
+                 "%s: shm layout mismatch: segment magic %llx version %u "
+                 "layout %08x, this binary expects magic %llx version %u "
+                 "layout %08x; rebuild all binaries\n",
+                 who,
+                 (unsigned long long)p->header.magic.load(std::memory_order_relaxed),
+                 p->header.version, p->header.layout_hash,
+                 (unsigned long long)MAGIC, VERSION, LAYOUT_HASH);
+    std::exit(2);
+  }
+  return p;
 }

@@ -4,21 +4,9 @@
 #include <vector>
 
 #include "core/level_bitmap.hpp"
+#include "check.hpp"
 
 using namespace core::equity;
-
-static int passed = 0;
-static int failed = 0;
-
-#define CHECK(cond)                                                            \
-  do {                                                                         \
-    if (cond) {                                                                \
-      ++passed;                                                                \
-    } else {                                                                   \
-      ++failed;                                                                \
-      fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);         \
-    }                                                                          \
-  } while (0)
 
 // Linear-scan reference the bitmap must match exactly.
 static uint32_t oracle_next(const std::vector<bool> &bits, uint32_t i) {
@@ -104,6 +92,5 @@ int main() {
   test_random<4096>(3, 20000);
   test_random<65536>(4, 3000); // fewer steps: oracle scan is O(N)
 
-  printf("%d passed, %d failed\n", passed, failed);
-  return failed ? 1 : 0;
+  return check_summary();
 }

@@ -8,7 +8,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <thread>
 
 #include "common/config.hpp"
@@ -17,10 +16,11 @@
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
 #include "common/platform/cpu_pin.hpp"
-#include "common/platform/spin_pause.hpp"
 #include "common/platform/tsc.hpp"
 #include "common/seqlock.hpp"
 #include "core/core.hpp"
+#include "core/market_update_builder.hpp"
+#include "core/primary_feed.hpp"
 #include "core/snapshot/book_snapshot.hpp"
 #include "core/snapshot/book_snapshotter.hpp"
 
@@ -50,6 +50,8 @@ struct DashboardPublisher {
   const core::CoreRing *in;           // input ring, read for occupancy only
   common::Seqlock<LatencyStats> *lat; // e2e latency source (multi-reader)
   double tsc_per_ns;
+  uint16_t instrument;
+  int8_t price_exp; // the instrument's tick exponent
 
   // EMA smoothing per snapshot frame (~30Hz) -> ~0.7s time constant.
   static constexpr double EMA_ALPHA = 0.05;
@@ -65,25 +67,26 @@ struct DashboardPublisher {
     dashboard::Snapshot<DEPTH> f{};
 
     f.event_seq = s.event_seq;
-    std::memcpy(f.stock_id, s.stock_id, 8);
-    f.best_bid = s.best_bid;
-    f.best_ask = s.best_ask;
+    f.instrument = instrument;
+    f.price_exp = price_exp;
     f.nb = s.nb;
     f.na = s.na;
 
     const bool have_bid = s.nb > 0 && s.best_bid != 0u;
     const bool have_ask = s.na > 0 && s.best_ask != UINT32_MAX;
+    f.best_bid = have_bid ? int64_t(s.best_bid) : 0;
+    f.best_ask = have_ask ? int64_t(s.best_ask) : 0;
     f.spread = (have_bid && have_ask && s.best_ask >= s.best_bid)
-                   ? (s.best_ask - s.best_bid)
-                   : 0u;
+                   ? int64_t(s.best_ask - s.best_bid)
+                   : 0;
 
-    uint64_t tot_bid = 0, tot_ask = 0;
+    int64_t tot_bid = 0, tot_ask = 0;
     for (int i = 0; i < s.nb; ++i) {
-      f.bids[i] = {s.bids[i].price, s.bids[i].shares, s.bids[i].order_count};
+      f.bids[i] = {s.bids[i].price, s.bids[i].shares, s.bids[i].order_count, 0};
       tot_bid += s.bids[i].shares;
     }
     for (int i = 0; i < s.na; ++i) {
-      f.asks[i] = {s.asks[i].price, s.asks[i].shares, s.asks[i].order_count};
+      f.asks[i] = {s.asks[i].price, s.asks[i].shares, s.asks[i].order_count, 0};
       tot_ask += s.asks[i].shares;
     }
     f.total_bid_qty = tot_bid;
@@ -95,8 +98,8 @@ struct DashboardPublisher {
 
     // volume-weighted mid (microprice): best prices weighted by the *opposite*
     // side's size, so it leans toward the thinner side. Display units.
-    const double bid_px = dashboard::to_display(s.best_bid);
-    const double ask_px = dashboard::to_display(s.best_ask);
+    const double bid_px = dashboard::to_display(f.best_bid, price_exp);
+    const double ask_px = dashboard::to_display(f.best_ask, price_exp);
     double vwmid;
     if (have_bid && have_ask) {
       const double bq = double(s.bids[0].shares);
@@ -144,55 +147,30 @@ struct DashboardPublisher {
   }
 };
 
-// Build the resolved exec feed frame from the freshly-captured book snapshot plus the
-// triggering event and any trade it produced. The exec feed's depth is a prefix of
-// the in-process snapshot, so we reuse its already-walked levels instead of walking
-// the book a second time on the hot path.
-static exec::MarketUpdate<exec::EXEC_DEPTH>
-make_market_update(const common::Event &ev, const core::BookSnapshot<DEPTH> &snap,
-                   const core::equity::OrderBook::Trade &trade) noexcept {
-  static_assert(exec::EXEC_DEPTH <= DEPTH,
-                "exec feed depth must fit within the in-process snapshot");
-  exec::MarketUpdate<exec::EXEC_DEPTH> mu{};
-  mu.event_seq = snap.event_seq;
-  mu.event_time = ev.timestamp;
-  mu.tsc_in = ev.tsc_in;
-  std::memcpy(mu.stock_id, snap.stock_id, sizeof(mu.stock_id));
-  mu.best_bid = snap.best_bid;
-  mu.best_ask = snap.best_ask;
-  mu.trade_price = trade.price;
-  mu.trade_size = trade.shares;
-  mu.trade_side = trade.side;
-  mu.nb = std::min(snap.nb, static_cast<int>(exec::EXEC_DEPTH));
-  mu.na = std::min(snap.na, static_cast<int>(exec::EXEC_DEPTH));
-  for (int i = 0; i < mu.nb; ++i)
-    mu.bids[i] = {snap.bids[i].price, snap.bids[i].shares,
-                  snap.bids[i].order_count};
-  for (int i = 0; i < mu.na; ++i)
-    mu.asks[i] = {snap.asks[i].price, snap.asks[i].shares,
-                  snap.asks[i].order_count};
-  return mu;
-}
-
 int main(int argc, char **argv) {
   if (argc != 2)
     std::abort();
 
-  int shm_fd = std::stoi(argv[1]);
-
   ShmSegment shm;
-  if (!shm.attach(shm_fd, ipc::SHM_SIZE))
-    std::abort();
-  auto *p = shm.as<ipc::PipelineShm>();
-  while (p->header.magic.load(std::memory_order_acquire) == 0) {
-    SPIN_PAUSE();
-  }
-  if (p->header.magic != ipc::MAGIC)
-    std::abort();
+  ipc::PipelineShm *p = ipc::attach_pipeline(argv[1], shm, "core_main");
 
   core::CoreRing *ring = &p->exchange_to_core;
-  exec::ExecRing *exec_ring = &p->core_to_exec;
+  exec::FeedRing *feed_ring = &p->feed_to_exec;
   dashboard::DashboardRing *dash_ring = &p->core_to_dashboard;
+
+  // Register the traded symbol. Prices keep the feed's 4-dp units (tick 1e-4) so
+  // sub-penny midpoint prints survive; shares are lots of 1.
+  ref::Instrument itch_row{};
+  itch_row.tick_mant = 1;
+  itch_row.tick_exp = -4;
+  itch_row.lot_mant = 1;
+  itch_row.min_qty_lots = 1;
+  itch_row.price_precision = 4;
+  itch_row.status = ref::ONLINE;
+  for (int i = 0; i < 8 && PRIMARY[i] != ' '; ++i)
+    itch_row.symbol[i] = PRIMARY[i];
+  std::memcpy(itch_row.venue, "ITCH", 4);
+  const uint16_t primary_instrument = p->instruments.add(itch_row);
 
   struct sigaction sa{};
   sa.sa_handler = on_signal;
@@ -227,74 +205,40 @@ int main(int argc, char **argv) {
   static core::BookSeqlock<DEPTH> book_seq;
   core::BookSnapshot<DEPTH> scratch{};
 
-  uint16_t primary_locate = 0;
-  bool primary_locked = false;
-  uint64_t primary_count = 0;
+  core::PrimaryFeed feed{engine, PRIMARY};
+
+  // Hot-thread counters, published to shm on the PUB_MASK cadence. A full feed ring
+  // drops the frame (never blocks) and flags the next one FEED_RESET.
+  stats::FeedStats feed_stats{};
+  feed_stats.mode = stats::FEED_ITCH;
+  bool pending_reset = false;
 
   auto process = [&](const common::Event &ev) {
-    core::equity::OrderBook *book = nullptr;
-    bool is_add = (ev.message_type == 'A' || ev.message_type == 'F');
-
-    if (is_add) {
-      // Subscription gate: only A/F carries the stock symbol on the wire.
-      if (std::memcmp(ev.stock, PRIMARY, 8) != 0)
-        return;
-      // Seed base_price below the symbol's first price so the in-range window
-      // brackets where the book will trade; adds outside it are dropped. The
-      // occupancy bitmap makes walk cost independent of where the populated
-      // range sits, so this only sets the drop boundary, not performance. For
-      // symbols cheaper than HALF the window, base clamps to 0.
-      constexpr uint32_t HALF =
-          core::equity::DEFAULT_LEVEL_COUNT / 2 * core::equity::PRICE_TICK;
-      core::equity::Price base = ev.price > HALF ? ev.price - HALF : 0u;
-      book = &engine.ensure(ev.stock_locate, ev.stock_locate, base);
-      if (!primary_locked) {
-        primary_locate = ev.stock_locate;
-        primary_locked = true;
-      }
-    } else {
-      book = engine.get(ev.stock_locate);
-      if (!book)
-        return;
-    }
-
-    ++primary_count;
-
     core::equity::OrderBook::Trade trade{};
-    switch (ev.message_type) {
-    case 'A':
-    case 'F':
-      book->on_add(ev.order_ref_number, ev.side, ev.price, ev.shares);
-      break;
-    case 'E':
-      trade = book->on_execute(ev.order_ref_number, ev.shares);
-      break;
-    case 'C':
-      trade = book->on_execute_with_price(ev.order_ref_number, ev.shares,
-                                          ev.price);
-      break;
-    case 'X':
-      book->on_cancel(ev.order_ref_number, ev.shares);
-      break;
-    case 'D':
-      book->on_delete(ev.order_ref_number);
-      break;
-    case 'U':
-      book->on_replace(ev.order_ref_number, ev.new_order_ref_number, ev.price,
-                       ev.shares);
-      break;
-    case 'P':
-      // Non-displayed (hidden) trade: real flow, but it never touches the visible
-      // book. Side/price/size come straight off the wire.
-      trade = {ev.price, ev.shares, ev.side};
-      break;
-    }
+    core::equity::OrderBook *book = feed.apply(ev, trade);
+    if (!book)
+      return;
 
-    // Publish the book snapshot to the in-process seqlock (dashboard path) and the
-    // resolved frame to the exec feed.
-    core::capture(scratch, *book, PRIMARY, primary_count);
+    // Exec frame first, built in place in the ring slot, then the book snapshot for
+    // the dashboard so strategy latency doesn't wait on the dashboard copy.
+    core::capture(scratch, *book, PRIMARY, feed.count);
+    if (auto *slot = feed_ring->try_claim()) {
+      core::build_market_update(*slot, ev, scratch, trade, primary_instrument,
+                                pending_reset ? exec::FEED_RESET : 0);
+      feed_ring->publish();
+      ++feed_stats.frames_pushed;
+      pending_reset = false;
+    } else {
+      ++feed_stats.frames_dropped;
+      pending_reset = true;
+    }
     book_seq.store(scratch);
-    (void)exec_ring->try_push(make_market_update(ev, scratch, trade));
+  };
+
+  auto publish_feed_stats = [&](uint64_t events_in) {
+    feed_stats.events_in = events_in;
+    feed_stats.heartbeat_tsc = read_tsc();
+    p->feed_stats.store(feed_stats);
   };
 
   // Hot thread publishes cumulative histograms here; both the snapshotter (for
@@ -303,7 +247,9 @@ int main(int argc, char **argv) {
 
   // snapshot thread: publishes dashboard frames to the shared ring at ~30Hz
   std::atomic<bool> snap_shutdown{false};
-  DashboardPublisher publisher{dash_ring, ring, &lat_seq, tsc_per_ns};
+  DashboardPublisher publisher{dash_ring,  ring,
+                               &lat_seq,   tsc_per_ns,
+                               primary_instrument, itch_row.tick_exp};
   std::thread snap_thread([&] {
     core::run_snapshotter<DEPTH>(book_seq, config::SNAPSHOT_CORE,
                                  std::chrono::milliseconds(33), snap_shutdown,
@@ -348,11 +294,16 @@ int main(int argc, char **argv) {
       if ((++n & PUB_MASK) == 0) {
         LatencyStats snap{hist_ipc, hist_core, hist_e2e};
         lat_seq.store(snap);
+        publish_feed_stats(n);
       }
     }
   }
-  while (ring->try_pop(ev))
+  uint64_t drained = 0; // kept out of n so benchmark counts stay comparable
+  while (ring->try_pop(ev)) {
     process(ev);
+    ++drained;
+  }
+  publish_feed_stats(n + drained);
 
   lat_shutdown.store(true, std::memory_order_release);
   lat_thread.join();
@@ -360,10 +311,14 @@ int main(int argc, char **argv) {
   snap_shutdown.store(true, std::memory_order_release);
   snap_thread.join();
 
-  std::fprintf(lat_log, "\n=== aggregated (n=%llu drops=%llu) ===\n",
+  std::fprintf(lat_log,
+               "\n=== aggregated (n=%llu drops=%llu frames=%llu "
+               "frames_dropped=%llu) ===\n",
                static_cast<unsigned long long>(n),
                static_cast<unsigned long long>(
-                   core::equity::g_drops.load(std::memory_order_relaxed)));
+                   core::equity::g_drops.load(std::memory_order_relaxed)),
+               static_cast<unsigned long long>(feed_stats.frames_pushed),
+               static_cast<unsigned long long>(feed_stats.frames_dropped));
   hist_ipc.dump(lat_log, "transit", tsc_per_ns);
   hist_core.dump(lat_log, "process", tsc_per_ns);
   hist_e2e.dump(lat_log, "e2e", tsc_per_ns);
@@ -373,7 +328,7 @@ int main(int argc, char **argv) {
   hist_e2e.dump_full(lat_log, "e2e", tsc_per_ns);
   std::fclose(lat_log);
 
-  if (!primary_locked)
+  if (feed.count == 0)
     std::printf("No %.8s events seen\n", PRIMARY);
   return 0;
 }

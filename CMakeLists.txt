@@ -115,6 +115,36 @@ add_executable(test_level_bitmap
 )
 target_include_directories(test_level_bitmap PRIVATE src)
 
+# ctest runs from build/ so feed paths like ../itch_feed resolve. Tests labelled
+# "slow" replay the ITCH feed; `ctest -LE slow` is the quick loop.
+add_executable(test_spsc_ring tests/test_spsc_ring.cpp)
+target_include_directories(test_spsc_ring PRIVATE src)
+target_link_libraries(test_spsc_ring PRIVATE Threads::Threads)
+
+add_executable(test_market_view tests/test_market_view.cpp)
+target_include_directories(test_market_view PRIVATE src)
+
+add_executable(test_wire_layout tests/test_wire_layout.cpp)
+target_include_directories(test_wire_layout PRIVATE src)
+
+add_executable(test_exec_replay
+    tests/test_exec_replay.cpp
+    src/exchange/itch/itch_parser.cpp
+    src/core/core.cpp
+)
+target_include_directories(test_exec_replay PRIVATE src)
+target_link_libraries(test_exec_replay PRIVATE Threads::Threads)
+
+enable_testing()
+foreach(t test_orderbook test_level_bitmap test_spsc_ring test_market_view
+          test_wire_layout)
+    add_test(NAME ${t} COMMAND ${t} WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+endforeach()
+foreach(t test_itch_parser test_exec_replay)
+    add_test(NAME ${t} COMMAND ${t} WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    set_tests_properties(${t} PROPERTIES LABELS slow)
+endforeach()
+
 add_executable(parse_to_orderbook
     tests/parse_to_orderbook.cpp
     src/exchange/itch/itch_parser.cpp

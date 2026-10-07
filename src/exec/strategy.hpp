@@ -1,32 +1,67 @@
 #pragma once
 
-#include "exec/fill_model.hpp"
 #include "exec/market_view.hpp"
+#include <cstdint>
 
 namespace exec {
 
+using OrderId = uint32_t;
+inline constexpr OrderId INVALID_ORDER = 0;
+
 // The surface a strategy sees each tick: read the market and account, and submit or
-// cancel shadow orders. A read/write wrapper over the MarketView and the FillModel.
+// cancel orders. Until the order router lands (plan Phase 2) orders are only tracked
+// here: they never leave the process and never fill.
 class StrategyContext {
 public:
-  StrategyContext(const MarketView &mv, FillModel &fills) noexcept
-      : mv_(mv), fills_(fills) {}
+  explicit StrategyContext(const MarketView &mv) noexcept : mv_(mv) {}
 
   const MarketView &market() const noexcept { return mv_; }
 
-  int64_t inventory() const noexcept { return fills_.inventory(); }
-  double pnl() const noexcept { return fills_.pnl(); }
+  int64_t inventory() const noexcept { return 0; }
+  double pnl() const noexcept { return 0.0; }
 
-  // Orders rest at the current event-time; the model applies the latency budget.
-  OrderId submit(common::Side side, uint32_t price, uint32_t qty) noexcept {
-    return fills_.submit(side, price, qty, mv_.event_time_ns());
+  // Price in ticks, qty in lots. Returns INVALID_ORDER for qty <= 0 or when all
+  // slots are live.
+  OrderId submit(common::Side side, int64_t price, int64_t qty) noexcept {
+    (void)side;
+    (void)price;
+    if (qty <= 0)
+      return INVALID_ORDER;
+    for (OrderId &slot : live_)
+      if (slot == INVALID_ORDER) {
+        slot = next_id_++;
+        ++orders_submitted_;
+        return slot;
+      }
+    return INVALID_ORDER;
   }
-  void cancel(OrderId id) noexcept { fills_.cancel(id); }
-  bool is_live(OrderId id) const noexcept { return fills_.is_live(id); }
+  void cancel(OrderId id) noexcept {
+    if (id == INVALID_ORDER)
+      return;
+    for (OrderId &slot : live_)
+      if (slot == id) {
+        slot = INVALID_ORDER;
+        return;
+      }
+  }
+  bool is_live(OrderId id) const noexcept {
+    if (id == INVALID_ORDER)
+      return false;
+    for (OrderId slot : live_)
+      if (slot == id)
+        return true;
+    return false;
+  }
+
+  uint64_t orders_submitted() const noexcept { return orders_submitted_; }
 
 private:
+  static constexpr int MAX_ORDERS = 64;
+
   const MarketView &mv_;
-  FillModel &fills_;
+  OrderId live_[MAX_ORDERS]{};
+  OrderId next_id_ = 1;
+  uint64_t orders_submitted_ = 0;
 };
 
 // Optional authoring base. The hot loop dispatches through the concept below, so a

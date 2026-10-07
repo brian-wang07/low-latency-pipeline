@@ -38,3 +38,11 @@ private:
   bool owner_{false};
   bool is_valid_{false};
 };
+
+namespace ipc {
+// Worker-side attach: parses the shm fd from fd_arg, maps the segment, waits for
+// the manager to publish it, and checks magic, version and layout_hash. Prints a
+// message and exits on any failure. `who` names the worker in messages.
+PipelineShm *attach_pipeline(const char *fd_arg, ShmSegment &shm,
+                             const char *who) noexcept;
+} // namespace ipc

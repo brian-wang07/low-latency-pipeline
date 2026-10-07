@@ -32,7 +32,7 @@ public:
   }
 
 private:
-  static constexpr uint32_t LOT = 100;
+  static constexpr int64_t LOT = 100;
   static constexpr int64_t POS_CAP = 1000;
   static constexpr uint64_t HEARTBEAT_MASK = (1ull << 20) - 1;
 

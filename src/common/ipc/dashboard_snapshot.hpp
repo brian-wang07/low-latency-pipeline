@@ -6,27 +6,34 @@
 
 namespace dashboard {
 
-// Prices arrive as uint32 4-decimal fixed point (scaled by 10000)
-inline constexpr double PRICE_SCALE = 10000.0;
-
-inline constexpr double to_display(uint32_t fixed) noexcept {
-  return static_cast<double>(fixed) / PRICE_SCALE;
+// Prices are int64 ticks of the snapshot's instrument; a tick is 10^price_exp
+// in display units (ITCH: -4).
+inline double to_display(int64_t ticks, int8_t price_exp) noexcept {
+  double scale = 1.0;
+  for (int e = price_exp; e < 0; ++e)
+    scale /= 10.0;
+  for (int e = price_exp; e > 0; --e)
+    scale *= 10.0;
+  return static_cast<double>(ticks) * scale;
 }
 
 struct Level {
-  uint32_t price;
-  uint32_t shares;
+  int64_t price;
+  int64_t qty;
   uint32_t order_count;
+  uint32_t _pad;
 };
 
 template <std::size_t depth> struct alignas(64) Snapshot {
   uint64_t event_seq;
-  char stock_id[8];
-  uint32_t best_bid;
-  uint32_t best_ask;
-  uint32_t spread;
-  uint64_t total_bid_qty;
-  uint64_t total_ask_qty;
+  int64_t best_bid; // 0 when the side is empty
+  int64_t best_ask; // 0 when the side is empty
+  int64_t spread;   // 0 unless both sides are present
+  int64_t total_bid_qty;
+  int64_t total_ask_qty;
+  uint16_t instrument;
+  int8_t price_exp;
+  uint8_t _pad;
   int32_t nb;
   int32_t na;
   Level bids[depth];

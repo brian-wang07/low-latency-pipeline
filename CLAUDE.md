@@ -8,17 +8,21 @@ plus an ImGui dashboard. The next phase (see `plan.md`) adds live crypto trading
 
 ```
 cmake -S . -B build && cmake --build build -j8     # Release by default
-cd build && ./test_orderbook && ./test_level_bitmap && ./test_itch_parser
+cd build && ctest -LE slow                         # fast unit tests
+cd build && ctest -L slow                          # full-feed replays, ~30 s each
 cd build && ./manager                              # runs the whole pipeline
 ```
 
-- Tests are standalone executables with a hand-rolled `CHECK` macro (`tests/test_orderbook.cpp`),
-  not ctest yet. `test_itch_parser` replays the full feed (~454M events) and takes a while.
+- Tests are standalone executables using the `CHECK` macro from `tests/check.hpp`, registered
+  with ctest (run from `build/`). `test_itch_parser` and `test_exec_replay` (label `slow`)
+  replay the full feed. `test_exec_replay` pins a digest of everything exec observes on NVDA;
+  `test_wire_layout` pins `ipc::LAYOUT_HASH` and sizes. Re-pin either only for an intended
+  change, with a note in the test (and a VERSION bump for released layouts).
+- Running `./manager` from a tool: start it with `setsid` (it SIGTERMs its own process group)
+  and find workers with `pidof`, not `pgrep -f`, which also matches the calling shell.
 - Run binaries from `build/`: the manager execs `./exchange_main`, `./core_main`,
   `./exec_main_$EXEC_STRATEGY` (default `logging`) and `./dashboard`, and the feed path is
   hardcoded as `../itch_feed/S071321-v50.txt`.
-- `EXEC_LATENCY_NS` overrides the shadow fill model's latency budget (default 10 us event time);
-  both are deleted in plan Phase 1.
 - Shared memory is a 16 MiB memfd from the hugepage pool; needs `vm.nr_hugepages=20` and
   `vm.hugetlb_shm_group=1000` (see README). This machine has both configured.
 
@@ -45,11 +49,19 @@ change so regressions are attributable.
 - `exchange_main` (core 2): `ItchParser` writes `common::Event` (128 B) into `exchange_to_core`.
 - `core_main` (hot thread core 4, snapshotter core 6, latency dump core 0): L3 `OrderBook` per
   `stock_locate` (robin-hood `OrderMap`, `PriceLevelArray` + radix-64 `OccupancyBitmap`,
-  cached TOB). Publishes `exec::MarketUpdate<5>` to `core_to_exec` per event (silently dropped
-  if full) and 15-level snapshots to the dashboard via seqlock → snapshotter → ring.
+  cached TOB); `core::PrimaryFeed` applies events for the one subscribed symbol. Per event it
+  builds `exec::MarketUpdate<10>` (576 B, int64 ticks/lots, instrument, flags) in place in
+  `feed_to_exec`; a full ring drops the frame, counts it in `FeedStats` and flags the next one
+  `FEED_RESET`. Then 15-level snapshots go to the dashboard via seqlock → snapshotter → ring.
+  It registers its symbol in the shm `InstrumentTable` at startup.
 - `exec_main_<name>` (core 3): one binary per strategy in CMake's `EXEC_STRATEGIES`
-  (`name:Type:header`), so `on_tick` inlines into `run_strategy<S>`. `MarketView` + shadow
-  `FillModel` (being removed, see below); strategies satisfy the `exec::Strategy` concept.
+  (`name:Type:header`), so `on_tick` inlines into `run_strategy<S>`. `MarketView` plus a
+  local order-id tracker in `StrategyContext` (nothing fills until the Phase 2 router);
+  strategies satisfy the `exec::Strategy` concept. `MarketView` counts `event_seq` gaps and
+  exposes `feed_reset()`; exec publishes `frames`/`frame_gaps` to `exec_stats`.
+- shm v3 (`ipc::VERSION` 3) also carries `Control`, the order/report rings and the stats
+  seqlocks, still without producers. Workers attach through `ipc::attach_pipeline`, which
+  checks magic, version and `LAYOUT_HASH` (`src/common/ipc/layout.hpp`).
 - `dashboard`: ImGui/ImPlot reader of the snapshot ring.
 
 The README's architecture diagram (matching engine, order loopback) is stale; the README is
@@ -84,7 +96,7 @@ hardening → benchmark-gated optimizations). Key decisions:
 
 - No in-process fill model. Live and sandbox fills come only from venue execution reports
   (GatewayRouter); ITCH mode uses a NullRouter (acks, never fills) and serves as the pipeline
-  latency benchmark. The shadow `FillModel` is deleted in Phase 1; do not reintroduce one.
+  latency benchmark. The shadow `FillModel` was deleted in Phase 1; do not reintroduce one.
 - Strategy research on historic data uses hftbacktest (Python/numba, in `research/`, outside
   CMake): order-level queue model on Kraken level3 data, measured order latency, Kraken's
   percentage fee model. It has no rate-limit model, so research strategies use
@@ -113,8 +125,8 @@ connection is unconfirmed.
 ## Known quirks in current code
 
 - `common::Event` is 128 B, not 64 B (`_pad[2]` is misleading).
-- `ItchParser::next()` back-pressures on `EXCHANGE_RING_CAPACITY` (4096) while writing the
-  8192-slot core ring, so queue depth never exceeds 50%; it also widens tail to uint64_t.
-- `core_main` drops exec frames silently when the exec ring is full; nothing counts it.
+- `core_main` hardcodes `PRIMARY` (TQQQ) and keeps the 20M benchmark cap commented out.
+- Exec stats are published every 65,536 frames and on exit, so `heartbeat_tsc` goes stale
+  while the feed is idle (Phase 2 adds a timer).
 - Seqlock fence ordering is x86-only; histogram buckets are power-of-two.
 - `build/plan.md` is an old, unrelated latency plan; the live plan is `plan.md` at the root.

@@ -1,27 +1,16 @@
 #pragma once
 
 #include "common/event.hpp"
+#include "common/ipc/control.hpp"
 #include "common/ipc/dashboard_snapshot.hpp"
+#include "common/ipc/instrument.hpp"
 #include "common/ipc/market_update.hpp"
+#include "common/ipc/order_msgs.hpp"
+#include "common/ipc/stats.hpp"
+#include "common/seqlock.hpp"
 #include "common/spsc_ring.hpp"
 #include <atomic>
 #include <cstdint>
-
-namespace exchange {
-
-// matching engine data feed
-// producers: itch parser, strategy process
-// consumer: matching engine
-inline constexpr std::size_t MAX_EXCHANGE_PRODUCERS = 2;
-inline constexpr std::uint32_t EXCHANGE_RING_CAPACITY = 4096;
-
-using ExchangeRing = common::SpscRing<common::Event, EXCHANGE_RING_CAPACITY>;
-
-struct alignas(64) ExchangeInputArray {
-  ExchangeRing ExchangeRings[MAX_EXCHANGE_PRODUCERS];
-};
-
-} // namespace exchange
 
 namespace core {
 
@@ -34,10 +23,10 @@ using CoreRing = common::SpscRing<common::Event, CORE_RING_CAPACITY>;
 
 namespace exec {
 
-// producer: core (feed handler), consumer: exec process
-inline constexpr std::size_t EXEC_DEPTH = 5;
-inline constexpr std::uint32_t EXEC_RING_CAPACITY = 8192;
-using ExecRing = common::SpscRing<MarketUpdate<EXEC_DEPTH>, EXEC_RING_CAPACITY>;
+// producer: core_main (ITCH) or the gateway MD thread (live), consumer: exec
+inline constexpr std::size_t EXEC_DEPTH = 10;
+inline constexpr std::uint32_t FEED_RING_CAPACITY = 8192;
+using FeedRing = common::SpscRing<MarketUpdate<EXEC_DEPTH>, FEED_RING_CAPACITY>;
 } // namespace exec
 
 namespace dashboard {
@@ -56,20 +45,31 @@ namespace ipc {
 inline constexpr const char *SHM_NAME = "pipeline_shm";
 inline constexpr size_t SHM_SIZE = 16 * 1024 * 1024;
 inline constexpr uint64_t MAGIC = 0xDEADBEEF;
-inline constexpr uint32_t VERSION = 2;
+inline constexpr uint32_t VERSION = 3;
 static_assert((SHM_SIZE & (SHM_SIZE - 1)) == 0);
 
+// Workers check version and layout_hash (ipc::LAYOUT_HASH in layout.hpp) and
+// refuse to run against a segment built from a different layout.
 struct alignas(64) ShmHeader {
   std::atomic<uint64_t> magic;
   uint32_t version;
-  uint32_t _pad;
+  uint32_t layout_hash;
 };
 
 struct alignas(64) PipelineShm {
   ShmHeader header;
+  Control control;
+  ref::InstrumentTable instruments;
   core::CoreRing exchange_to_core;
-  exec::ExecRing core_to_exec;
+  exec::FeedRing feed_to_exec;
+  oe::OrderRing exec_to_gateway;
+  oe::ExecRing gateway_to_exec;
   dashboard::DashboardRing core_to_dashboard;
+  common::Seqlock<stats::FeedStats> feed_stats;
+  common::Seqlock<stats::ExecStats> exec_stats;
+  common::Seqlock<stats::GatewayStats> gateway_stats;
+  common::Seqlock<stats::PositionStats> positions;
+  common::Seqlock<stats::OpenOrders> open_orders;
 };
 
 static_assert(sizeof(PipelineShm) <= SHM_SIZE);

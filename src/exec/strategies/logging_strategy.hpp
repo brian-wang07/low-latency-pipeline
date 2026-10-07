@@ -17,10 +17,10 @@ public:
       ++trades_;
     if (ticks_ == 1 || (ticks_ & HEARTBEAT_MASK) == 0)
       std::fprintf(stderr,
-                   "[exec] seq=%llu ticks=%llu trades=%llu bid=%u ask=%u\n",
+                   "[exec] seq=%llu ticks=%llu trades=%llu bid=%lld ask=%lld\n",
                    (unsigned long long)m.event_seq(),
                    (unsigned long long)ticks_, (unsigned long long)trades_,
-                   m.best_bid(), m.best_ask());
+                   (long long)m.best_bid(), (long long)m.best_ask());
   }
 
 private:

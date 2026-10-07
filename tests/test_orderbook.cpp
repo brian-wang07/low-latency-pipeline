@@ -4,22 +4,10 @@
 
 #include "common/event.hpp"
 #include "core/core.hpp"
+#include "check.hpp"
 
 using namespace core::equity;
 using common::Side;
-
-static int passed = 0;
-static int failed = 0;
-
-#define CHECK(cond)                                                            \
-  do {                                                                         \
-    if (cond) {                                                                \
-      ++passed;                                                                \
-    } else {                                                                   \
-      ++failed;                                                                \
-      fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);         \
-    }                                                                          \
-  } while (0)
 
 // Fixed-point prices (4 decimal places). BASE must be <= all prices used.
 static constexpr Price BASE = 999900;  // 99.9900 - base, anchors the level array
@@ -136,6 +124,5 @@ int main() {
   test_multiple_orders_same_level();
   test_execute_with_price();
 
-  printf("%d passed, %d failed\n", passed, failed);
-  return failed ? 1 : 0;
+  return check_summary();
 }

@@ -37,15 +37,12 @@ void ItchParser::next() {
   uint8_t msg_type = *(cursor_ + 2);
   cursor_ += 3;
 
-  uint64_t tail = ring_->tail.load(std::memory_order_relaxed);
-  while (tail - ring_->head.load(std::memory_order_acquire) >=
-         exchange::EXCHANGE_RING_CAPACITY) {
+  common::Event *slot;
+  while ((slot = ring_->try_claim()) == nullptr) {
     if (shutdown_ && *shutdown_)
       return;
     SPIN_PAUSE();
   }
-
-  auto *slot = &ring_->slots[tail & ring_->MASK];
 
   switch (msg_type) {
   // i hate this lmfao (thank you claude)
@@ -184,5 +181,5 @@ void ItchParser::next() {
 
   cursor_ += frame_length - 1;
   slot->tsc_in = read_tsc();
-  ring_->tail.store(tail + 1, std::memory_order_release);
+  ring_->publish();
 }

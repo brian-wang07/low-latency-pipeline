@@ -1,3 +1,4 @@
+#include "common/ipc/layout.hpp"
 #include "common/ipc/shm.hpp"
 #include "common/ipc/shm_segment.hpp"
 #include <atomic>
@@ -57,6 +58,7 @@ int main() {
   auto *p = new (shm.get_address()) ipc::PipelineShm();
 
   p->header.version = ipc::VERSION;
+  p->header.layout_hash = ipc::LAYOUT_HASH;
   p->header.magic.store(ipc::MAGIC, std::memory_order_release);
 
   pid_t pgid = getpgrp();

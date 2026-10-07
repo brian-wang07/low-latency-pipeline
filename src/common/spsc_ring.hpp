@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <new>
+#include <utility>
 
 namespace common {
 
@@ -16,32 +18,39 @@ template <typename T, uint32_t capacity> struct alignas(64) SpscRing {
 
   alignas(64) T slots[capacity];
 
-  bool try_push(const T &item) noexcept {
-
+  // Two-phase produce: fill the claimed slot in place, then publish(). Lets the
+  // producer make its last store (e.g. tsc_in) right before the release, and skips
+  // the copy of a staged T. Repeated claims without a publish return the same slot.
+  T *try_claim() noexcept {
     uint32_t write_idx = tail.load(std::memory_order_relaxed);
     uint32_t read_idx = head.load(std::memory_order_acquire);
 
     if (write_idx - read_idx == capacity)
+      return nullptr;
+
+    return &slots[write_idx & MASK];
+  }
+
+  void publish() noexcept {
+    tail.store(tail.load(std::memory_order_relaxed) + 1,
+               std::memory_order_release);
+  }
+
+  bool try_push(const T &item) noexcept {
+    T *slot = try_claim();
+    if (!slot)
       return false;
-
-    slots[write_idx & MASK] = item;
-    tail.store(write_idx + 1, std::memory_order_release);
-
+    *slot = item;
+    publish();
     return true;
-  };
+  }
 
   template <typename... Args> bool try_emplace(Args &&...args) noexcept {
-    // basically always prefer this, Event type has no heap allocated fields
-
-    uint32_t write_idx = tail.load(std::memory_order_relaxed);
-    uint32_t read_idx = head.load(std::memory_order_acquire);
-
-    if (write_idx - read_idx == capacity)
+    T *slot = try_claim();
+    if (!slot)
       return false;
-
-    new (&slots[write_idx & MASK]) T(std::forward<Args>(args)...);
-    tail.store(write_idx + 1, std::memory_order_release);
-
+    new (slot) T(std::forward<Args>(args)...);
+    publish();
     return true;
   }
 
