@@ -1,5 +1,6 @@
 benchmark results - 20M messages, 1ns interval per message, ticker NVDA
 results are written to latency.log in build directory
+conditions: fresh boot, no other processes running, feed pre-read with cat itch_feed/S071321-v50.txt > /dev/null
 
 commit eb5baf2
 ```
@@ -236,4 +237,61 @@ commit eb5baf2
   [19]  210.0us..420.0us  n=82         cum=100.00%
   [20]  420.0us..840.0us  n=165        cum=100.00%
   [21]  840.0us..1.7ms    n=53         cum=100.00%
+  ```
+
+  commit 2cd81d8 (exec frame push in core_main, exec_main_logging on CPU 3)
+  NOT under standard conditions, so not fully comparable: no fresh boot, other processes
+  running (desktop session, a build just before), and the feed was not pre-read with
+  `cat itch_feed/S071321-v50.txt > /dev/null`. Re-run under standard conditions to replace it.
+  ```
+  === aggregated (n=20000000 drops=1) ===
+[lat] transit p50=205ns p99=205ns p999=3.3us max=947.6us n=20000000
+[lat] process p50=26ns p99=51ns p999=103ns max=950.7us n=20000000
+[lat] e2e p50=205ns p99=410ns p999=3.3us max=950.8us n=20000000
+
+=== full distribution ===
+[lat-full] transit n=20000000 max=947.6us
+  [ 7]     51ns..103ns    n=4096677    cum= 20.48%
+  [ 8]    103ns..205ns    n=15707715   cum= 99.02%
+  [ 9]    205ns..410ns    n=37958      cum= 99.21%
+  [10]    410ns..820ns    n=54473      cum= 99.48%
+  [11]    820ns..1.6us    n=61746      cum= 99.79%
+  [12]    1.6us..3.3us    n=28798      cum= 99.94%
+  [13]    3.3us..6.6us    n=8614       cum= 99.98%
+  [14]    6.6us..13.1us   n=3063       cum=100.00%
+  [15]   13.1us..26.3us   n=657        cum=100.00%
+  [16]   26.3us..52.5us   n=29         cum=100.00%
+  [17]   52.5us..105.0us  n=16         cum=100.00%
+  [18]  105.0us..210.0us  n=32         cum=100.00%
+  [19]  210.0us..420.1us  n=60         cum=100.00%
+  [20]  420.1us..840.1us  n=128        cum=100.00%
+  [21]  840.1us..1.7ms    n=34         cum=100.00%
+[lat-full] process n=20000000 max=950.7us
+  [ 5]     13ns..26ns     n=19612294   cum= 98.06%
+  [ 6]     26ns..51ns     n=367048     cum= 99.90%
+  [ 7]     51ns..103ns    n=5653       cum= 99.92%
+  [ 8]    103ns..205ns    n=369        cum= 99.93%
+  [ 9]    205ns..410ns    n=12627      cum= 99.99%
+  [10]    410ns..820ns    n=1830       cum=100.00%
+  [11]    820ns..1.6us    n=101        cum=100.00%
+  [12]    1.6us..3.3us    n=53         cum=100.00%
+  [13]    3.3us..6.6us    n=13         cum=100.00%
+  [14]    6.6us..13.1us   n=11         cum=100.00%
+  [21]  840.1us..1.7ms    n=1          cum=100.00%
+[lat-full] e2e n=20000000 max=950.8us
+  [ 7]     51ns..103ns    n=221238     cum=  1.11%
+  [ 8]    103ns..205ns    n=19555612   cum= 98.88%
+  [ 9]    205ns..410ns    n=53193      cum= 99.15%
+  [10]    410ns..820ns    n=64322      cum= 99.47%
+  [11]    820ns..1.6us    n=63275      cum= 99.79%
+  [12]    1.6us..3.3us    n=29544      cum= 99.94%
+  [13]    3.3us..6.6us    n=8762       cum= 99.98%
+  [14]    6.6us..13.1us   n=3092       cum=100.00%
+  [15]   13.1us..26.3us   n=662        cum=100.00%
+  [16]   26.3us..52.5us   n=29         cum=100.00%
+  [17]   52.5us..105.0us  n=16         cum=100.00%
+  [18]  105.0us..210.0us  n=32         cum=100.00%
+  [19]  210.0us..420.1us  n=60         cum=100.00%
+  [20]  420.1us..840.1us  n=128        cum=100.00%
+  [21]  840.1us..1.7ms    n=35         cum=100.00%
   ```

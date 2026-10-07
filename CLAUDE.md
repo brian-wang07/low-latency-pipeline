@@ -27,9 +27,15 @@ cd build && ./manager                              # runs the whole pipeline
 core_main writes latency histograms to `build/latency.log` (override with `LAT_LOG=`).
 `scripts/plot_latency.py [log] -o out.png` plots them. Each benchmark is recorded in
 `benchmarks/benchmarks.md` under its commit hash with a plot in `benchmarks/plots/<hash>.png`
-(20M messages, NVDA). The latest entry is 153fec8; there is no entry yet for 2cd81d8, which
-added the exec-frame push to core_main's hot path. Record one before changing the hot path so
-regressions are attributable.
+(20M messages, NVDA). The committed core_main has the 20M cap commented out and PRIMARY =
+TQQQ; to benchmark, locally uncomment `MAX_EVENTS` (and its loop condition), set PRIMARY to
+NVDA, run `EXEC_STRATEGY=logging ./manager` (exit code 1 at the cap is expected), then revert.
+Standard conditions: fresh boot, no other processes running, and the feed warmed into page
+cache first with `cat itch_feed/S071321-v50.txt > /dev/null`. Claude cannot reboot or idle the
+machine, so a run made from a session is marked as not fully accurate in benchmarks.md.
+The latest entry is 2cd81d8, the baseline for plan Phase 1; it was run from a Claude session,
+not under standard conditions, and should be re-run. Record an entry for every hot-path
+change so regressions are attributable.
 
 ## Architecture (current)
 
@@ -97,10 +103,12 @@ hardening → benchmark-gated optimizations). Key decisions:
   counter that heavily penalizes cancelling young orders (prefer amend, hold quotes longer).
   No Kraken spot sandbox: `validate=true` is the dry run.
 - Real money only via Kraken, only with `live=1`, starting in PAUSE.
+- ITCH prices use a 0.0001 price unit (tick_exp -4) in the int64 frames, not 0.01: sub-penny
+  midpoint prints must survive. Live-mode cores: exec 4, gateway MD 2, gateway OE 3.
+- API keys live in `.env` at the repo root (gitignored, 0600); never commit or print it.
 
-Open items noted against the plan: the Risks section's "NFS box / apt libssl-dev" note does
-not describe this machine; the live-mode core map puts the gateway OE thread on non-isolated
-CPU 8; Kraken WS token behavior after 15-minute expiry on an open connection is unconfirmed.
+Open item noted against the plan: Kraken WS token behavior after 15-minute expiry on an open
+connection is unconfirmed.
 
 ## Known quirks in current code
 

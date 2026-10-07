@@ -142,7 +142,9 @@ behind an order send; everything on the wire-to-decision-to-wire path is busy-po
 allocation-free and stamped with read_tsc(). Core map for the 6C/12T box (SMT pairs (0,1),(2,3)
 ...): ITCH mode keeps today's assignment (exchange 2, core hot 4, exec 3, snapshotter 6). Live
 mode has no exchange_main or core_main, so exec moves to 4 (a physical core of its own), gateway
-MD rx takes 2, gateway OE takes 8, housekeeping and stats 0, dashboard unpinned. Cores come from
+MD rx takes 2, gateway OE takes 3 (MD's SMT sibling, mirroring ITCH mode's exchange/exec pair,
+so exec keeps physical core 2 to itself), housekeeping and stats 0, dashboard unpinned. For a
+contention-free OE thread, isolate CPUs 6,7 as well and move OE to 6. Cores come from
 the config file so this is a one-line change per machine. Steer the NIC RX queue IRQ to a
 non-sibling core on the same socket, or use SO_BUSY_POLL.
 
@@ -239,8 +241,10 @@ Pipeline pieces that feed research:
   widened to int64 ticks and lots, gains an instrument index and flags, and keeps a template
   depth (EXEC_DEPTH raised to 10 to match Coinbase L2 and Kraken book depth 10).
 - Price and quantity: int64 ticks and lots per instrument, converted at the producer using a
-  shared InstrumentTable. The ITCH producer converts its uint32 4-dp prices to ticks of 0.01 (a
-  divide by 100 that the compiler folds) and shares to lots of 1. Strategies quote in ticks.
+  shared InstrumentTable. The ITCH instrument's price unit is 0.0001 (tick_exp -4), so its
+  uint32 4-dp prices widen to int64 unchanged and shares map to lots of 1. A 0.01 tick would
+  truncate sub-penny midpoint prints ('P') and 'C' execution prices. Strategies quote in ticks;
+  on ITCH they round quotes to a penny themselves.
 - The equity L3 book in core is unchanged in layout and behavior; core_main only widens the frame
   it emits.
 - Crypto L2 book lives in the gateway MD thread: TopNBook<N> (two sorted arrays of at most N
@@ -502,9 +506,10 @@ Keep the files and the shape; extend them.
 
 ## Core (ITCH feed producer) changes
 
-- make_market_update: convert uint32 4-dp prices to ticks (divide by PRICE_TICK), shares to
-  lots, fill instrument (0 for the single ITCH symbol, registered in the InstrumentTable by
-  core_main at start with tick 0.01 and lot 1), set TWO_SIDED and LAST_IN_BATCH (always, one
+- make_market_update: widen uint32 4-dp prices to int64 (identity, price unit 0.0001) and map
+  the empty-ask sentinel UINT32_MAX to INT64_MAX, shares to lots, fill instrument (0 for the
+  single ITCH symbol, registered in the InstrumentTable by core_main at start with price unit
+  0.0001 and lot 1), set TWO_SIDED and LAST_IN_BATCH (always, one
   event per frame), count drops in FeedStats and set FEED_RESET on the frame after a drop.
 - Publish order: push the exec frame before the dashboard seqlock store so strategy latency is
   not behind the 448 B dashboard copy.
@@ -818,9 +823,9 @@ Research track (parallel from Phase 3, medium): kraken_recorder, research/ with 
   the benchmark comparison and Phase 7 can instantiate depth 5 for ITCH if it shows.
 - Silent frame drops on the feed ring exist today; after Phase 1 they are counted and signalled
   so strategies know their view of the book was interrupted.
-- This NFS box lacks OpenSSL headers, glfw3, hugepages (HugePages_Total 0) and the ITCH feed.
-  With the hugepage fallback and LL_BUILD_LIVE/LL_BUILD_DASHBOARD off, Phases 1 and 2 build and
-  their tests run here; live phases need the 6C/12T machine (sudo apt install libssl-dev).
+- The target is the Fedora 43 6C/12T box: hugepages, glfw3 and the ITCH feed are present;
+  OpenSSL headers are not (sudo dnf install openssl-devel before Phase 3). The hugepage fallback
+  and LL_BUILD_LIVE/LL_BUILD_DASHBOARD keep Phases 1 and 2 buildable on hosts without them.
 - Existing quirks to fix while touching the code: Event is 128 B not 64 B (the _pad[2] is
   misleading); the ITCH parser back-pressures on EXCHANGE_RING_CAPACITY (4096) while writing an
   8192 ring, so queue depth never exceeds 50%; the parser widens tail to uint64_t (wraps after
@@ -862,11 +867,12 @@ Phase 3 plus steps 4.1 and 4.2, so it can be pulled forward to get live data ear
 ### Phase 0: prerequisites (no pipeline code)
 
 0.1 Commit plan.md and CLAUDE.md.
-0.2 Benchmark HEAD (2cd81d8) with the logging strategy, 20M events, and add the benchmarks.md
-    entry and plot. Every later hot-path change is compared against this, not 153fec8.
-0.3 Fix the plan's errata: the Risks note describing an NFS box (this machine is the Fedora
-    6C/12T target; it needs `dnf install openssl-devel`, not apt), and the live-mode core map
-    that puts the gateway OE thread on non-isolated CPU 8.
+0.2 Benchmark HEAD (2cd81d8) with the logging strategy, 20M events, NVDA, and add the
+    benchmarks.md entry and plot. Every later hot-path change is compared against this, not
+    153fec8.
+0.3 Fix the plan's errata: the Risks note describing an NFS box, the live-mode core map that put
+    the gateway OE thread on non-isolated CPU 8 (now 3), and the ITCH price unit (now 0.0001).
+    Done.
 0.4 Accounts, in the background since they have lead time: Coinbase Exchange sandbox login and
     an API key with trade permission (confirm FIX logon is allowed); Kraken account verified to
     at least Intermediate, an API key with query and trade permissions only, the tier's rate
@@ -882,15 +888,17 @@ Done when: baseline entry exists for 2cd81d8 and both venue keys are in hand.
 1.3 ShmSegment::create() falls back from MFD_HUGETLB to normal pages with a warning.
 1.4 Mechanical rename: exec::ExecRing to FeedRing, core_to_exec to feed_to_exec.
 1.5 src/common/ipc/instrument.hpp (64 B Instrument, InstrumentTable); core_main registers the
-    ITCH symbol (tick 0.01, lot 1) at startup.
+    ITCH symbol (price unit 0.0001, lot 1) at startup.
 1.6 Delete the shadow FillModel: fill_model.hpp, its use in runner.hpp, strategy.hpp and
     exec_main.cpp, and EXEC_LATENCY_NS. Until NullRouter lands in 2.5, StrategyContext::submit
-    hands out ids and tracks live orders locally, and nothing fills. Done when exec_main_dummy
-    runs and logs its order count for a fixed event count (the reference for 1.7).
+    hands out ids and tracks live orders locally, and nothing fills. make_market_update moves to
+    src/core/market_update_builder.hpp, and test_exec_replay (in-process parser, book, builder,
+    MarketView and both strategies over the first ~2M events, no shm so no drops) prints a
+    digest that is the reference for 1.7.
 1.7 MarketUpdate v2: int64 ticks and lots, instrument, flags, EXEC_DEPTH 10. Carry the
     mechanical int64 change through MarketView, StrategyContext, both strategies and
-    make_market_update (4 dp to ticks). Done when DummyQuoter's order count and quote prices on
-    the same event count match 1.6.
+    make_market_update (identity widen, explicit empty-ask sentinel). Done when
+    test_exec_replay's digest matches 1.6.
 1.8 Wire types with no producers yet: order_msgs.hpp, control.hpp, stats.hpp. PipelineShm v3
     with ipc::VERSION 3 and a constexpr layout_hash; every worker checks both and aborts with a
     message. test_wire_layout pins sizeof/offsetof goldens.
